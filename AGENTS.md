@@ -18,7 +18,7 @@ Each has its own `package.json`. Install and run commands separately.
 
 Ports: Auth 9099 · Functions 5001 · Firestore 8080 · Hosting 5000 · Database 9000
 
-Start: `npx firebase emulators:start` (or `npx -y firebase-tools@latest emulators:start`)
+Start: `npm run emulators` (imports `emulator-data` on start; run `npm run emulators:export` in a separate terminal for periodic saves)
 
 ## Environment Variables
 
@@ -28,12 +28,20 @@ Start: `npx firebase emulators:start` (or `npx -y firebase-tools@latest emulator
 
 ## Architecture Notes
 
-- **Scheduler**: Rule-based (not LLM) — allocates goal time into 09:00–18:00 Mon–Sun slots between events
-- **LLM integration**: Telegram `/plan` and ChatPanel use OpenCode Zen API (`big-pickle` model) with tool calling (createMainGoal, createWeeklyGoal, generateSchedule)
-- **Firestore collections**: `events`, `goals`, `mainGoals`, `plans`, `telegramUsers`
+- **LLM integration**: ChatPanel and Telegram `/plan` use OpenCode Zen API (`big-pickle` model) with 12 tool-calling tools (CRUD for goals, targets, events + list operations)
+- **RTDB prompt templates**: Telegram commands fetch configurable `systemPrompt` + `userTemplate` from `prompts/{command}` in Realtime Database
+- **Firestore collections**: `users/{uid}/events`, `users/{uid}/targets`, `users/{uid}/goals`, `archives`, `telegramUsers`
 - **Deployment region**: `asia-southeast1`
 - **Hosting**: SPA rewrite — all routes → `/index.html`
 
 ## Firebase Skills
 
 Available in `.agents/skills/` — use the skill tool to load when working with Firebase services (Firestore rules, Auth, Hosting, etc.)
+
+## Timeline
+
+`timeline.md` tracks completed and pending project milestones.
+
+- **To append**: read last line, add new line with `YYYY-MM-DD ✅/❌ Feature`
+- **To find incomplete items**: grep for `❌` only when explicitly asked
+- **Do not read the full file** unless specifically needed

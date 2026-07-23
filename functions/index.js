@@ -1,160 +1,10 @@
 const {onCall, onRequest} = require("firebase-functions/https");
-const {defineString} = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
-
-// Load .env for local emulator; no-op in production
-try {
-  require("dotenv").config();
-} catch (_) { /* no-op in production */ }
+const {FieldValue} = require("firebase-admin/firestore");
 
 admin.initializeApp();
 const db = admin.firestore();
-
-const DAYS_OF_WEEK = [
-  "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-];
-
-// ── Secrets (declared for Firebase Functions; fall back to process.env for emulator) ──
-const telegramBotToken = defineString("TELEGRAM_BOT_TOKEN");
-// eslint-disable-next-line no-unused-vars
-const llmApiKey = defineString("LLM_API_KEY");
-// eslint-disable-next-line no-unused-vars
-const llmProvider = defineString("LLM_PROVIDER");
-// eslint-disable-next-line no-unused-vars
-const llmModel = defineString("LLM_MODEL");
-
-// ── Helpers ──
-
-function getWeekDays(weekOf) {
-  const monday = new Date(weekOf + "T00:00:00");
-  return DAYS_OF_WEEK.map((day, i) => {
-    const d = new Date(monday);
-    d.setDate(monday.getDate() + i);
-    return {day, date: d.toISOString().split("T")[0]};
-  });
-}
-
-/**
- * Rule-based scheduler: slots goals into free time between events.
- * Replace with an LLM call when AI provider is configured.
- */
-// eslint-disable-next-line no-unused-vars
-function scheduleGoals(events, goals, weekDays, mainGoals = []) {
-  // mainGoals are available for context (used in future LLM-based scheduling)
-  // Current rule-based scheduler ignores mainGoals
-  const slots = [];
-  const sortedGoals = [...goals].sort((a, b) => b.priority - a.priority);
-
-  for (const goal of sortedGoals) {
-    let hoursRemaining = goal.estimatedHours;
-
-    for (const {day, date} of weekDays) {
-      if (hoursRemaining <= 0) break;
-
-      const dayStart = "09:00";
-      const dayEnd = "18:00";
-
-      const dayEvents = events
-          .filter((e) => e.date === date)
-          .sort((a, b) => a.startTime.localeCompare(b.startTime));
-
-      let freeSlots = [{start: dayStart, end: dayEnd}];
-      for (const ev of dayEvents) {
-        const newFree = [];
-        for (const fs of freeSlots) {
-          if (ev.startTime >= fs.end || ev.endTime <= fs.start) {
-            newFree.push(fs);
-          } else {
-            if (fs.start < ev.startTime) newFree.push({start: fs.start, end: ev.startTime});
-            if (fs.end > ev.endTime) newFree.push({start: ev.endTime, end: fs.end});
-          }
-        }
-        freeSlots = newFree;
-      }
-
-      for (const fs of freeSlots) {
-        if (hoursRemaining <= 0) break;
-
-        const [sh, sm] = fs.start.split(":").map(Number);
-        const [eh, em] = fs.end.split(":").map(Number);
-        const slotHours = ((eh * 60 + em) - (sh * 60 + sm)) / 60;
-        if (slotHours <= 0) continue;
-
-        const assignHours = Math.min(hoursRemaining, Math.min(slotHours, 3));
-        const assignMinutes = Math.round(assignHours * 60);
-        const startMinutes = sh * 60 + sm;
-        const endMinutes = startMinutes + assignMinutes;
-
-        const pad = (n) => String(n).padStart(2, "0");
-        slots.push({
-          day,
-          date,
-          startTime: `${pad(Math.floor(startMinutes / 60))}:${pad(startMinutes % 60)}`,
-          endTime: `${pad(Math.floor(endMinutes / 60))}:${pad(endMinutes % 60)}`,
-          goalId: goal.id || "",
-          goalText: goal.text,
-        });
-
-        hoursRemaining -= assignHours;
-      }
-    }
-  }
-  return slots;
-}
-
-/**
- * Fetches events + goals for a user/week and returns a planned schedule.
- */
-async function buildPlan(uid, weekOf) {
-  const eventsSnap = await db
-      .collection("events")
-      .where("userId", "==", uid)
-      .where("date", ">=", weekOf)
-      .get();
-  const events = [];
-  eventsSnap.forEach((doc) => {
-    const d = doc.data();
-    events.push({id: doc.id, title: d.title, date: d.date, startTime: d.startTime, endTime: d.endTime});
-  });
-
-  const goalsSnap = await db
-      .collection("goals")
-      .where("userId", "==", uid)
-      .where("weekOf", "==", weekOf)
-      .get();
-  const goals = [];
-  goalsSnap.forEach((doc) => {
-    const d = doc.data();
-    goals.push({id: doc.id, text: d.text, priority: d.priority, estimatedHours: d.estimatedHours, deadline: d.deadline});
-  });
-
-  const mainGoalsSnap = await db
-      .collection("mainGoals")
-      .where("userId", "==", uid)
-      .get();
-  const mainGoals = [];
-  mainGoalsSnap.forEach((doc) => {
-    const d = doc.data();
-    mainGoals.push({
-      id: doc.id,
-      title: d.title,
-      description: d.description,
-      targetDate: d.targetDate,
-      status: d.status,
-    });
-  });
-
-  const weekDays = getWeekDays(weekOf);
-
-  // TODO: Replace with LLM call when AI provider is configured.
-  // Read provider from process.env / secrets:
-  //   const provider = (llmApiKey.value() || process.env.LLM_API_KEY)
-  //                   ? (process.env.LLM_PROVIDER || "openai") : null;
-  //   if (provider) { ... call LLM ... }
-
-  return scheduleGoals(events, goals, weekDays, mainGoals);
-}
 
 // ── Callable: testConnection (smoke test for emulator CORS) ──
 
@@ -166,29 +16,10 @@ exports.testConnection = onCall(
     },
 );
 
-// ── Callable: generateWeeklyPlan (used by the web app) ──
-
-exports.generateWeeklyPlan = onCall(
-    {maxInstances: 10, secrets: ["LLM_API_KEY", "LLM_PROVIDER", "LLM_MODEL"], region: "asia-southeast1"},
-    async (request) => {
-      const {weekOf} = request.data;
-      const uid = request.auth?.uid;
-
-      if (!uid) throw new Error("User must be authenticated.");
-      if (!weekOf) throw new Error("weekOf is required.");
-
-      logger.info(`Generating plan for user ${uid}, week ${weekOf}`);
-
-      const slots = await buildPlan(uid, weekOf);
-
-      logger.info(`Generated ${slots.length} slots for week ${weekOf}`);
-      return {slots};
-    },
-);
-
 // ── Tool definitions for LLM function calling ──
 
 const TOOLS = [
+  // ── Create ──
   {
     type: "function",
     function: {
@@ -197,53 +28,413 @@ const TOOLS = [
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Title of the main goal" },
-          description: { type: "string", description: "Detailed description of the goal" },
-          targetDate: { type: "string", description: "Target completion date (ISO format, e.g. 2026-12-31)" },
-          status: { type: "string", enum: ["active", "completed", "cancelled"], description: "Status of the goal" },
+          title: {type: "string", description: "Title of the main goal"},
+          description: {type: "string", description: "Detailed description of the goal"},
+          targetDate: {type: "string", description: "Target completion date (ISO format, e.g. 2026-12-31)"},
+          status: {type: "string", enum: ["not_started", "in_progress", "done"], description: "Status of the goal"},
         },
-        required: ["title", "description", "targetDate", "status"],
+        required: ["title", "status"],
       },
     },
   },
   {
     type: "function",
     function: {
-      name: "createWeeklyGoal",
-      description: "Create a new weekly goal for the current or specified week",
+      name: "createTarget",
+      description: "Create a new target for the user",
       parameters: {
         type: "object",
         properties: {
-          text: { type: "string", description: "Description of the weekly goal" },
-          priority: { type: "number", description: "Priority level 1-5 (1=lowest, 5=highest)" },
-          estimatedHours: { type: "number", description: "Estimated hours needed" },
-          weekOf: { type: "string", description: "ISO Monday date of the week (e.g. 2026-07-06)" },
-          mainGoalId: { type: "string", description: "Optional ID of an associated main goal" },
+          text: {type: "string", description: "Description of the target"},
+          priority: {type: "number", description: "Priority level 1-5 (1=lowest, 5=highest)"},
+          estimatedHours: {type: "number", description: "Estimated hours needed"},
+          status: {type: "string", enum: ["current", "upcoming", "recurring"], description: "Status of the target (current, upcoming, or recurring)"},
+          mainGoalId: {type: "string", description: "Optional ID of an associated main goal"},
         },
-        required: ["text", "priority", "estimatedHours", "weekOf"],
+        required: ["text", "priority", "estimatedHours"],
       },
     },
   },
   {
     type: "function",
     function: {
-      name: "generateSchedule",
-      description: "Generate a weekly schedule by fitting goals into free time between events",
+      name: "createEvent",
+      description: "Create a new calendar event for the user",
       parameters: {
         type: "object",
         properties: {
-          weekOf: { type: "string", description: "ISO Monday date of the week (e.g. 2026-07-06)" },
-          method: {
-            type: "string",
-            enum: ["llm", "rule"],
-            description: "Scheduling method: 'rule' uses the deterministic scheduler, 'llm' lets the AI generate the schedule intelligently",
-          },
+          title: {type: "string", description: "Title of the event"},
+          date: {type: "string", description: "Date of the event (ISO format, e.g. 2026-07-15)"},
+          startTime: {type: "string", description: "Start time (HH:MM format, e.g. 09:00)"},
+          endTime: {type: "string", description: "End time (HH:MM format, e.g. 10:00)"},
         },
-        required: ["weekOf"],
+        required: ["title", "date", "startTime", "endTime"],
+      },
+    },
+  },
+  // ── Update ──
+  {
+    type: "function",
+    function: {
+      name: "updateMainGoal",
+      description: "Update an existing main goal. Only provided fields will be changed.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {type: "string", description: "ID of the main goal to update"},
+          title: {type: "string", description: "New title"},
+          description: {type: "string", description: "New description"},
+          targetDate: {type: "string", description: "New target date (ISO format)"},
+          status: {type: "string", enum: ["not_started", "in_progress", "done"], description: "New status"},
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "updateTarget",
+      description: "Update an existing target. Only provided fields will be changed.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {type: "string", description: "ID of the target to update"},
+          text: {type: "string", description: "New description"},
+          priority: {type: "number", description: "New priority level 1-5"},
+          estimatedHours: {type: "number", description: "New estimated hours"},
+          status: {type: "string", enum: ["current", "upcoming", "recurring"], description: "New status"},
+          mainGoalId: {type: "string", description: "New linked main goal ID (empty string to unlink)"},
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "updateEvent",
+      description: "Update an existing calendar event. Only provided fields will be changed.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {type: "string", description: "ID of the event to update"},
+          title: {type: "string", description: "New title"},
+          date: {type: "string", description: "New date (ISO format)"},
+          startTime: {type: "string", description: "New start time (HH:MM)"},
+          endTime: {type: "string", description: "New end time (HH:MM)"},
+        },
+        required: ["id"],
+      },
+    },
+  },
+  // ── Delete ──
+  {
+    type: "function",
+    function: {
+      name: "deleteMainGoal",
+      description: "Delete a main goal by its ID",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {type: "string", description: "ID of the main goal to delete"},
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deleteTarget",
+      description: "Delete a target by its ID",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {type: "string", description: "ID of the target to delete"},
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deleteEvent",
+      description: "Delete a calendar event by its ID",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {type: "string", description: "ID of the event to delete"},
+        },
+        required: ["id"],
+      },
+    },
+  },
+  // ── List / Read ──
+  {
+    type: "function",
+    function: {
+      name: "listMainGoals",
+      description: "List all main goals for the user",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "listTargets",
+      description: "List targets for the user. Optionally filter by status.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: {type: "string", enum: ["current", "upcoming", "recurring"], description: "Filter by status. Omit to list all targets."},
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "listEvents",
+      description: "List calendar events for a given week (defaults to current week if omitted)",
+      parameters: {
+        type: "object",
+        properties: {
+          weekOf: {type: "string", description: "ISO Monday date to start from (e.g. 2026-07-06). Defaults to current week."},
+          weekEnd: {type: "string", description: "ISO Sunday date to end at (e.g. 2026-07-12). Defaults to current week's Sunday."},
+        },
+        required: [],
       },
     },
   },
 ];
+
+const BASE_SYSTEM_PROMPT = [
+  "You are Schedule AI's assistant. You manage the user's schedule stored in their database.",
+  "You have NO knowledge of the user's data unless it is provided in the current message or you can access it through your tools.",
+  "IMPORTANT: You MUST only use the exact tool names and parameter names defined in your tools list. Never invent tool names or parameters.",
+  "",
+  "DEFINITIONS:",
+  "- Main Goals: Long-term, aspirational objectives that span weeks or months (e.g. \"Launch my startup\", \"Get fit\"). They have a title, optional description, optional target date, and status (not_started, in_progress, done). Use createMainGoal / updateMainGoal / deleteMainGoal / listMainGoals.",
+  "- Targets: Short-term, actionable tasks for the current week (e.g. \"Finish report\", \"Exercise 3x\"). They have a text description, priority 1-5, estimated hours, and status (current, upcoming, recurring). Targets can be linked to a Main Goal via mainGoalId. Use createTarget / updateTarget / deleteTarget / listTargets.",
+  "- Events: Fixed calendar appointments with a specific date and time range (e.g. \"Team meeting, July 15, 09:00-10:00\"). Use createEvent / updateEvent / deleteEvent / listEvents.",
+  "",
+  "TOOLS:",
+  "- createMainGoal: title (required), description, targetDate (ISO), status (not_started|in_progress|done, required)",
+  "- createTarget: text (required), priority 1-5 (required), estimatedHours (required), status (current|upcoming|recurring), mainGoalId",
+  "- createEvent: title (required), date ISO (required), startTime HH:MM (required), endTime HH:MM (required)",
+  "- updateMainGoal: id (required), title, description, targetDate, status (not_started|in_progress|done)",
+  "- updateTarget: id (required), text, priority, estimatedHours, status (current|upcoming|recurring), mainGoalId",
+  "- updateEvent: id (required), title, date, startTime, endTime",
+  "- deleteMainGoal: id (required)",
+  "- deleteTarget: id (required)",
+  "- deleteEvent: id (required)",
+  "- listMainGoals: (no parameters)",
+  "- listTargets: status (current|upcoming|recurring, optional)",
+  "- listEvents: weekOf (ISO Monday date, optional), weekEnd (ISO Sunday date, optional)",
+  "",
+  "RULES:",
+  "- For read requests (list, see, get, show): Call the appropriate tool immediately, then summarize results.",
+  "- For write requests (create, update, delete): First gather ALL required details from the user through conversation. Present a summary and ask for confirmation. Only call the tool AFTER the user confirms. Never assume values for required fields.",
+  "- For bulk operations (delete all, update all, rename many, etc.): First call the relevant list tool to collect every matching ID, then ask for confirmation. After confirmation, include ALL write tool calls in a single response as an array — do not execute them one at a time.",
+  "- When the current message includes context injected from /goals, /events, or /targets, use that context directly and do not ask the user to retype it.",
+  "- Never fabricate, guess, or hallucinate data.",
+  "- When a tool returns a result, base your response ONLY on what the tool explicitly returned. Do not assume, extrapolate, or infer data that the tool did not provide. If a tool says 'not found', say exactly that — do not claim other data doesn't exist.",
+  "- When executing multiple write operations at once, include ALL tool calls in a single response array. The system supports parallel tool execution.",
+  "- When you mention any main goal, target, or event in your response, ALWAYS include its document ID in brackets like [id: <ID>]. This is critical for follow-up operations.",
+].join("\n");
+
+function formatMainGoal(goal, index) {
+  const statusEmoji = {"not_started": "⬜", "in_progress": "🔵", "done": "✅"};
+  return `${index + 1}. ${statusEmoji[goal.status] || "❓"} ${goal.title}${goal.targetDate ? ` (due: ${goal.targetDate})` : ""} [id: ${goal.id}]`;
+}
+
+function formatEventLine(event, index) {
+  return `${index + 1}. ${event.title} (${event.date} ${event.startTime}-${event.endTime})`;
+}
+
+function formatTargetLine(target, index) {
+  return `${index + 1}. ${target.text} [Priority ${target.priority}, ${target.estimatedHours}h, ${target.status || "current"}]`;
+}
+
+function formatToolResult(toolName, result) {
+  if (toolName === "listMainGoals") {
+    if (!result.items || result.items.length === 0) return "Main Goals:\nNone";
+    const lines = result.items.map((item, i) => `${i + 1}. ${item.title}${item.targetDate ? ` (due: ${item.targetDate})` : ""} (${item.status}) [id: ${item.id}]`);
+    return `Main Goals:\n${lines.join("\n")}`;
+  }
+  if (toolName === "listTargets") {
+    if (!result.items || result.items.length === 0) return "Targets:\nNone";
+    const lines = result.items.map((item, i) => `${i + 1}. ${item.text} [Priority ${item.priority}, ${item.estimatedHours}h, ${item.status || "current"}] [id: ${item.id}]`);
+    return `Targets:\n${lines.join("\n")}`;
+  }
+  if (toolName === "listEvents") {
+    if (!result.items || result.items.length === 0) return "Events:\nNone";
+    const lines = result.items.map((item, i) => `${i + 1}. ${item.title} (${item.date} ${item.startTime}-${item.endTime}) [id: ${item.id}]`);
+    return `Events:\n${lines.join("\n")}`;
+  }
+  if (result.id && result.summary) return `${result.summary} [id: ${result.id}]`;
+  return null;
+}
+
+async function fetchMainGoalsForUser(uid) {
+  const snap = await db.collection("users").doc(uid).collection("goals").get();
+  const goals = [];
+  snap.forEach((doc) => {
+    const data = doc.data();
+    goals.push({id: doc.id, ...data});
+  });
+  goals.sort((a, b) => {
+    const aDone = a.status === "done" ? 1 : 0;
+    const bDone = b.status === "done" ? 1 : 0;
+    if (aDone !== bDone) return aDone - bDone;
+    return (a.targetDate || "").localeCompare(b.targetDate || "") || (a.title || "").localeCompare(b.title || "");
+  });
+  return goals;
+}
+
+async function fetchEventsForWeek(uid, weekOf, weekEnd) {
+  let eventsQuery = db
+      .collection("users")
+      .doc(uid)
+      .collection("events")
+      .where("date", ">=", weekOf);
+  if (weekEnd) {
+    eventsQuery = eventsQuery.where("date", "<=", weekEnd);
+  }
+  const eventsSnap = await eventsQuery.get();
+  const events = [];
+  eventsSnap.forEach((doc) => {
+    events.push({id: doc.id, ...doc.data()});
+  });
+  events.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
+  return events;
+}
+
+async function fetchEventsFromToday(uid) {
+  const today = getCurrentDate();
+  const eventsSnap = await db
+      .collection("users")
+      .doc(uid)
+      .collection("events")
+      .where("date", ">=", today)
+      .get();
+  const events = [];
+  eventsSnap.forEach((doc) => {
+    events.push({id: doc.id, ...doc.data()});
+  });
+  events.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
+  return events;
+}
+
+async function fetchTargetsForUser(uid, targetStatus) {
+  let targetsQuery = db
+      .collection("users")
+      .doc(uid)
+      .collection("targets");
+  if (targetStatus) {
+    const statuses = Array.isArray(targetStatus) ? targetStatus : [targetStatus];
+    targetsQuery = targetsQuery.where("status", "in", statuses);
+  }
+  const targetsSnap = await targetsQuery.get();
+  const targets = [];
+  targetsSnap.forEach((doc) => {
+    targets.push({id: doc.id, ...doc.data()});
+  });
+  targets.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  return targets;
+}
+
+async function buildContextPrompt(uid, command, trailingText) {
+  const weekOf = getCurrentWeekMonday();
+  const today = getCurrentDate();
+
+  if (command === "goals") {
+    const goals = await fetchMainGoalsForUser(uid);
+    const currentGoals = goals.filter((goal) => goal.status !== "done");
+    const goalsText = currentGoals.length
+      ? currentGoals.map((goal, index) => formatMainGoal(goal, index)).join("\n")
+      : "No current goals set.";
+    return {
+      systemMessage: BASE_SYSTEM_PROMPT,
+      userMessage: `${goalsText}\n\nUser request: ${trailingText || "Please help me with these current goals."}`.trim(),
+    };
+  }
+
+  if (command === "events") {
+    const events = await fetchEventsFromToday(uid);
+    const eventsText = events.length
+      ? events.map((event, index) => formatEventLine(event, index)).join("\n")
+      : "No upcoming events.";
+    return {
+      systemMessage: BASE_SYSTEM_PROMPT,
+      userMessage: `${eventsText}\n\nUser request: ${trailingText || "Please help me with these events."}`.trim(),
+    };
+  }
+
+  if (command === "targets") {
+    const targets = await fetchTargetsForUser(uid, ["current", "recurring"]);
+    const targetsText = targets.length
+      ? targets.map((target, index) => formatTargetLine(target, index)).join("\n")
+      : "No current targets set.";
+    return {
+      systemMessage: BASE_SYSTEM_PROMPT,
+      userMessage: `${targetsText}\n\nUser request: ${trailingText || "Please help me with these current targets."}`.trim(),
+    };
+  }
+
+  if (command === "tplan") {
+    const template = await getPromptTemplate("tplan");
+    if (!template) {
+      return {systemMessage: BASE_SYSTEM_PROMPT, userMessage: "The /tplan command isn't configured yet. Ask the admin to set up prompts/tplan in the database."};
+    }
+    const weekEnd = getCurrentWeekSunday();
+    const {events, targets, mainGoals} = await fetchUserData(uid, weekOf, undefined, weekEnd);
+    const filledTemplate = fillTemplate(template.userTemplate, {
+      targets: targets.length ? targets.join("\n") : "No targets set.",
+      events: events.length ? events.join("\n") : "No events scheduled.",
+      mainGoals: mainGoals.length ? mainGoals.join("\n") : "No main goals set.",
+      weekOf,
+      today,
+    });
+    const context = template.systemPrompt + "\n\n" + filledTemplate;
+    return {
+      systemMessage: BASE_SYSTEM_PROMPT,
+      userMessage: `${context}\n\nUser request: ${trailingText || "Please help me plan new targets for this week."}`.trim(),
+    };
+  }
+
+  if (command === "plan") {
+    const template = await getPromptTemplate("plan");
+    if (!template) {
+      return {systemMessage: BASE_SYSTEM_PROMPT, userMessage: "The /plan command isn't configured yet. Ask the admin to set up prompts/plan in the database."};
+    }
+    const weekEnd = getCurrentWeekSunday();
+    const {events, targets} = await fetchUserData(uid, weekOf, ["current", "recurring"], weekEnd);
+    const filledTemplate = fillTemplate(template.userTemplate, {
+      targets: targets.length ? targets.join("\n") : "No current targets set.",
+      events: events.length ? events.join("\n") : "No events scheduled.",
+      weekOf,
+      today,
+    });
+    const context = template.systemPrompt + "\n\n" + filledTemplate;
+    return {
+      systemMessage: BASE_SYSTEM_PROMPT,
+      userMessage: `${context}\n\nUser request: ${trailingText || "Please help me create a day-by-day schedule."}`.trim(),
+    };
+  }
+
+  return {
+    systemMessage: BASE_SYSTEM_PROMPT,
+    userMessage: trailingText || `Please help me with my schedule for ${weekOf} (${today}).`,
+  };
+}
 
 /**
  * Handles an LLM tool call by routing to the appropriate handler.
@@ -255,15 +446,17 @@ async function handleToolCall(toolCall, uid) {
   const {id, function: {name, arguments: argsJson}} = toolCall;
   const args = JSON.parse(argsJson);
 
-  switch (name) {
+  try {
+    switch (name) {
+    // ── Create ──
+
     case "createMainGoal": {
-      const docRef = await db.collection("mainGoals").add({
+      const docRef = await db.collection("users").doc(uid).collection("goals").add({
         title: args.title,
-        description: args.description,
-        targetDate: args.targetDate,
+        description: args.description || null,
+        targetDate: args.targetDate || null,
         status: args.status,
-        userId: uid,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
       });
       return {
         toolCallId: id,
@@ -271,67 +464,173 @@ async function handleToolCall(toolCall, uid) {
       };
     }
 
-    case "createWeeklyGoal": {
-      const goalData = {
+    case "createTarget": {
+      const targetData = {
         text: args.text,
         priority: args.priority,
         estimatedHours: args.estimatedHours,
-        weekOf: args.weekOf,
-        userId: uid,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: args.status || "current",
+        createdAt: FieldValue.serverTimestamp(),
       };
-      if (args.mainGoalId) goalData.mainGoalId = args.mainGoalId;
-      const docRef = await db.collection("goals").add(goalData);
+      if (args.mainGoalId) targetData.mainGoalId = args.mainGoalId;
+      const docRef = await db.collection("users").doc(uid).collection("targets").add(targetData);
       return {
         toolCallId: id,
-        result: {success: true, id: docRef.id, summary: `Created weekly goal "${args.text}"`},
+        result: {success: true, id: docRef.id, summary: `Created target "${args.text}" (${targetData.status})`},
       };
     }
 
-    case "generateSchedule": {
-      const method = args.method || "rule";
-      if (method === "rule") {
-        const slots = await buildPlan(uid, args.weekOf);
-        return {
-          toolCallId: id,
-          result: {success: true, method: "rule", slots, summary: `Generated schedule with ${slots.length} time slots`},
-        };
-      }
-      // method === "llm": fetch user data and return for LLM to schedule
-      const eventsSnap = await db.collection("events").where("userId", "==", uid).where("date", ">=", args.weekOf).get();
-      const events = [];
-      eventsSnap.forEach((doc) => {
-        const d = doc.data();
-        events.push({id: doc.id, title: d.title, date: d.date, startTime: d.startTime, endTime: d.endTime});
+    case "createEvent": {
+      const docRef = await db.collection("users").doc(uid).collection("events").add({
+        title: args.title,
+        date: args.date,
+        startTime: args.startTime,
+        endTime: args.endTime,
+        createdAt: FieldValue.serverTimestamp(),
       });
-
-      const goalsSnap = await db.collection("goals").where("userId", "==", uid).where("weekOf", "==", args.weekOf).get();
-      const goals = [];
-      goalsSnap.forEach((doc) => {
-        const d = doc.data();
-        goals.push({id: doc.id, text: d.text, priority: d.priority, estimatedHours: d.estimatedHours});
-      });
-
-      const mainGoalsSnap = await db.collection("mainGoals").where("userId", "==", uid).get();
-      const mainGoals = [];
-      mainGoalsSnap.forEach((doc) => {
-        const d = doc.data();
-        mainGoals.push({id: doc.id, title: d.title, description: d.description, targetDate: d.targetDate, status: d.status});
-      });
-
-      const weekDays = getWeekDays(args.weekOf);
-
       return {
         toolCallId: id,
-        result: {
-          success: true,
-          method: "llm",
-          events,
-          goals,
-          mainGoals,
-          weekDays,
-          summary: `Fetched ${events.length} events, ${goals.length} goals, and ${mainGoals.length} main goals for ${args.weekOf}`,
-        },
+        result: {success: true, id: docRef.id, summary: `Created event "${args.title}" on ${args.date} ${args.startTime}-${args.endTime}`},
+      };
+    }
+
+    // ── Update ──
+
+    case "updateMainGoal": {
+      const ref = db.collection("users").doc(uid).collection("goals").doc(args.id);
+      const snap = await ref.get();
+      if (!snap.exists) return {toolCallId: id, result: {success: false, error: "Main goal not found"}};
+      const updates = {};
+      if (args.title !== undefined) updates.title = args.title;
+      if (args.description !== undefined) updates.description = args.description;
+      if (args.targetDate !== undefined) updates.targetDate = args.targetDate;
+      if (args.status !== undefined) updates.status = args.status;
+      await ref.update(updates);
+      return {
+        toolCallId: id,
+        result: {success: true, id: args.id, summary: `Updated main goal "${args.id}"`},
+      };
+    }
+
+    case "updateTarget": {
+      const ref = db.collection("users").doc(uid).collection("targets").doc(args.id);
+      const snap = await ref.get();
+      if (!snap.exists) return {toolCallId: id, result: {success: false, error: "Target not found"}};
+      const updates = {};
+      if (args.text !== undefined) updates.text = args.text;
+      if (args.priority !== undefined) updates.priority = args.priority;
+      if (args.estimatedHours !== undefined) updates.estimatedHours = args.estimatedHours;
+      if (args.status !== undefined) updates.status = args.status;
+      if (args.mainGoalId !== undefined) updates.mainGoalId = args.mainGoalId || FieldValue.delete();
+      await ref.update(updates);
+      return {
+        toolCallId: id,
+        result: {success: true, id: args.id, summary: `Updated target "${args.id}"`},
+      };
+    }
+
+    case "updateEvent": {
+      const ref = db.collection("users").doc(uid).collection("events").doc(args.id);
+      const snap = await ref.get();
+      if (!snap.exists) return {toolCallId: id, result: {success: false, error: "Event not found"}};
+      const updates = {};
+      if (args.title !== undefined) updates.title = args.title;
+      if (args.date !== undefined) updates.date = args.date;
+      if (args.startTime !== undefined) updates.startTime = args.startTime;
+      if (args.endTime !== undefined) updates.endTime = args.endTime;
+      await ref.update(updates);
+      return {
+        toolCallId: id,
+        result: {success: true, id: args.id, summary: `Updated event "${args.id}"`},
+      };
+    }
+
+    // ── Delete ──
+
+    case "deleteMainGoal": {
+      const ref = db.collection("users").doc(uid).collection("goals").doc(args.id);
+      const snap = await ref.get();
+      if (!snap.exists) return {toolCallId: id, result: {success: false, error: "Main goal not found"}};
+      await ref.delete();
+      return {
+        toolCallId: id,
+        result: {success: true, summary: `Deleted main goal "${snap.data().title}" (id: ${args.id})`},
+      };
+    }
+
+    case "deleteTarget": {
+      const ref = db.collection("users").doc(uid).collection("targets").doc(args.id);
+      const snap = await ref.get();
+      if (!snap.exists) return {toolCallId: id, result: {success: false, error: "Target not found"}};
+      await ref.delete();
+      return {
+        toolCallId: id,
+        result: {success: true, summary: `Deleted target "${snap.data().text}" (id: ${args.id})`},
+      };
+    }
+
+    case "deleteEvent": {
+      const ref = db.collection("users").doc(uid).collection("events").doc(args.id);
+      const snap = await ref.get();
+      if (!snap.exists) return {toolCallId: id, result: {success: false, error: "Event not found"}};
+      await ref.delete();
+      return {
+        toolCallId: id,
+        result: {success: true, summary: `Deleted event "${snap.data().title}" (id: ${args.id})`},
+      };
+    }
+
+    // ── List / Read ──
+
+    case "listMainGoals": {
+  const snap = await db.collection("users").doc(uid).collection("goals").get();
+      const items = [];
+      snap.forEach((doc) => {
+        const data = doc.data();
+        const item = {id: doc.id, ...data};
+        if (item.createdAt && item.createdAt.toDate) item.createdAt = item.createdAt.toDate().toISOString();
+        items.push(item);
+      });
+      return {
+        toolCallId: id,
+        result: {success: true, count: items.length, items, summary: `Listed ${items.length} main goal(s)`},
+      };
+    }
+
+    case "listTargets": {
+      let q = db.collection("users").doc(uid).collection("targets");
+      if (args.status) {
+        q = q.where("status", "==", args.status);
+      }
+      const snap = await q.get();
+      const items = [];
+      snap.forEach((doc) => {
+        const data = doc.data();
+        const item = {id: doc.id, ...data};
+        if (item.createdAt && item.createdAt.toDate) item.createdAt = item.createdAt.toDate().toISOString();
+        items.push(item);
+      });
+      return {
+        toolCallId: id,
+        result: {success: true, count: items.length, items, summary: `Listed ${items.length} target(s)`},
+      };
+    }
+
+    case "listEvents": {
+      const weekOf = args.weekOf || getCurrentWeekMonday();
+      const weekEnd = args.weekEnd || getCurrentWeekSunday();
+      let eventsQuery = db.collection("users").doc(uid).collection("events").where("date", ">=", weekOf).where("date", "<=", weekEnd);
+      const snap = await eventsQuery.get();
+      const items = [];
+      snap.forEach((doc) => {
+        const data = doc.data();
+        const item = {id: doc.id, ...data};
+        if (item.createdAt && item.createdAt.toDate) item.createdAt = item.createdAt.toDate().toISOString();
+        items.push(item);
+      });
+      return {
+        toolCallId: id,
+        result: {success: true, count: items.length, items, summary: `Listed ${items.length} event(s)`},
       };
     }
 
@@ -340,7 +639,36 @@ async function handleToolCall(toolCall, uid) {
         toolCallId: id,
         result: {success: false, error: `Unknown tool: ${name}`},
       };
+    }
+  } catch (err) {
+    logger.error(`Tool "${name}" failed for user ${uid}:`, err.message || err);
+    throw err;
   }
+}
+
+// ── Helper: parse XML tool calls from big-pickle model response ──
+
+function parseXmlToolCalls(content) {
+  if (!content || !content.includes("<tool_call>")) return [];
+  const calls = [];
+  const callRegex = /<tool_call>\s*<function>([\s\S]*?)<\/function>\s*<parameters>([\s\S]*?)<\/parameters>\s*<\/tool_call>/g;
+  let match;
+  while ((match = callRegex.exec(content)) !== null) {
+    const name = match[1].trim();
+    const paramXml = match[2];
+    const args = {};
+    const paramRegex = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g;
+    let pMatch;
+    while ((pMatch = paramRegex.exec(paramXml)) !== null) {
+      args[pMatch[1]] = pMatch[2].trim();
+    }
+    calls.push({
+      id: `xml_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      type: "function",
+      function: {name, arguments: JSON.stringify(args)},
+    });
+  }
+  return calls;
 }
 
 // ── Helper: get the ISO date string for the current week's Monday ──
@@ -349,8 +677,100 @@ function getCurrentWeekMonday() {
   const d = new Date();
   const day = d.getDay();
   const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-  const monday = new Date(d.setDate(diff));
-  return monday.toISOString().split("T")[0];
+  d.setDate(diff);
+  d.setHours(0, 0, 0, 0);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dayStr = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dayStr}`;
+}
+
+// ── Helper: get the ISO date string for the current week's Sunday ──
+
+function getCurrentWeekSunday() {
+  const monday = getCurrentWeekMonday();
+  const d = new Date(monday + "T00:00:00");
+  d.setDate(d.getDate() + 6);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dayStr = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dayStr}`;
+}
+
+// ── Helper: get today's ISO date string ──
+
+function getCurrentDate() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dayStr = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dayStr}`;
+}
+
+// ── Helper: fetch a prompt template from RTDB ──
+
+const rtdb = admin.database();
+
+async function getPromptTemplate(command) {
+  const snap = await rtdb.ref(`prompts/${command}`).once("value");
+  return snap.val();
+}
+
+// ── Helper: fetch user's targets and events for placeholder filling ──
+
+async function fetchUserData(uid, weekOf, targetStatus, weekEnd) {
+  let eventsQuery = db
+      .collection("users")
+      .doc(uid)
+      .collection("events")
+      .where("date", ">=", weekOf);
+  if (weekEnd) {
+    eventsQuery = eventsQuery.where("date", "<=", weekEnd);
+  }
+  const eventsSnap = await eventsQuery.get();
+  const events = [];
+  eventsSnap.forEach((doc) => {
+    const d = doc.data();
+    events.push(`${d.title} (${d.date} ${d.startTime}-${d.endTime})`);
+  });
+
+  let targetsQuery = db
+      .collection("users")
+      .doc(uid)
+      .collection("targets");
+  if (targetStatus) {
+    const statuses = Array.isArray(targetStatus) ? targetStatus : [targetStatus];
+    targetsQuery = targetsQuery.where("status", "in", statuses);
+  }
+  const targetsSnap = await targetsQuery.get();
+  const targets = [];
+  targetsSnap.forEach((doc) => {
+    const d = doc.data();
+    targets.push(`${d.text} [Priority ${d.priority}, ${d.estimatedHours}h, ${d.status || "current"}]`);
+  });
+
+  const mainGoalsSnap = await db
+      .collection("users")
+      .doc(uid)
+      .collection("goals")
+      .get();
+  const mainGoals = [];
+  mainGoalsSnap.forEach((doc) => {
+    const d = doc.data();
+    mainGoals.push(`${d.title} (${d.status})`);
+  });
+
+  return {events, targets, mainGoals};
+}
+
+// ── Helper: fill template placeholders ──
+
+function fillTemplate(template, vars) {
+  let result = template;
+  for (const [key, value] of Object.entries(vars)) {
+    result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), value);
+  }
+  return result;
 }
 
 // ── HTTP: telegramWebhook (called by Telegram when users message the bot) ──
@@ -361,7 +781,7 @@ function getCurrentWeekMonday() {
 // Then Telegram will POST updates to this endpoint whenever users message the bot.
 
 exports.telegramWebhook = onRequest(
-    {maxInstances: 10, secrets: ["TELEGRAM_BOT_TOKEN", "LLM_API_KEY", "LLM_PROVIDER", "LLM_MODEL"], region: "asia-southeast1"},
+    {maxInstances: 10, region: "asia-southeast1"},
     async (req, res) => {
     // Only accept POST
       if (req.method !== "POST") {
@@ -369,7 +789,7 @@ exports.telegramWebhook = onRequest(
         return;
       }
 
-      const token = telegramBotToken.value() || process.env.TELEGRAM_BOT_TOKEN;
+      const token = process.env.TELEGRAM_BOT_TOKEN;
       if (!token) {
         logger.error("TELEGRAM_BOT_TOKEN not configured");
         res.status(500).send("Bot not configured");
@@ -396,20 +816,24 @@ exports.telegramWebhook = onRequest(
           "I can help you plan your week. First, link your account:\n" +
           "Send me your Firebase email to get started.\n\n" +
           "Commands:\n" +
-          "/week - Show this week's plan\n" +
-          "/plan <goals> - Generate a plan from goals\n" +
-          "/link <email> - Link your Telegram to Firebase";
+          "/link <email> - Link your Telegram to Firebase\n" +
+          "/today - Show today's date\n" +
+          "/goals - Show your current main goals\n" +
+          "/targets - Show your current targets\n" +
+          "/events - Show upcoming events (today onward)\n" +
+          "/week - Show current week date range and events\n" +
+          "/tplan - Generate new targets for this week\n" +
+          "/plan - Create a daily schedule from current targets";
         } else if (/^\/link\s+/i.test(text)) {
           const email = text.replace(/^\/link\s+/i, "").trim();
           // Store mapping: telegramUsers/{fromId} -> { email, uid: null (until verified) }
           await db.collection("telegramUsers").doc(String(fromId)).set({
             email,
             chatId,
-            linkedAt: admin.firestore.FieldValue.serverTimestamp(),
+            linkedAt: FieldValue.serverTimestamp(),
           });
           reply = `✅ Linked to ${email}. You can now manage your schedule via Telegram!`;
-        } else if (/^\/week$/.test(text)) {
-        // Look up the user
+        } else if (/^\/week$/i.test(text)) {
           const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
           if (!userDoc.exists) {
             reply = "❌ You haven't linked your account yet. Use /link <email>";
@@ -418,35 +842,71 @@ exports.telegramWebhook = onRequest(
             if (!uid) {
               reply = "❌ Your account is pending verification. Try again later.";
             } else {
-              // Find the Monday of current week
-              const d = new Date();
-              const day = d.getDay();
-              const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-              const monday = new Date(d.setDate(diff));
-              const weekStart = monday.toISOString().split("T")[0];
-              const slots = await buildPlan(uid, weekStart);
-
-              if (slots.length === 0) {
-                reply = "📅 No plan yet this week. Add some goals and events first!";
+              const monday = getCurrentWeekMonday();
+              const sunday = getCurrentWeekSunday();
+              const today = getCurrentDate();
+              const mondayDate = new Date(monday + "T00:00:00");
+              const sundayDate = new Date(sunday + "T00:00:00");
+              const todayDate = new Date(today + "T00:00:00");
+              const options = {month: "short", day: "numeric"};
+              const label = `${mondayDate.toLocaleDateString("en-US", options)} – ${sundayDate.toLocaleDateString("en-US", options)}, ${sundayDate.getFullYear()}`;
+              const dayName = todayDate.toLocaleDateString("en-US", {weekday: "long"});
+              const weekHeader = `📅 Current week: ${label}\n📆 Today: ${dayName}, ${todayDate.toLocaleDateString("en-US", options)}`;
+              const events = await fetchEventsForWeek(uid, monday, sunday);
+              if (events.length === 0) {
+                reply = weekHeader + "\n\n🗓️ No events scheduled for this week.";
               } else {
-                reply = "📅 *This Week's Plan*\n\n";
-                const byDay = {};
-                for (const s of slots) {
-                  if (!byDay[s.day]) byDay[s.day] = [];
-                  byDay[s.day].push(s);
-                }
-                for (const day of DAYS_OF_WEEK) {
-                  if (!byDay[day]) continue;
-                  reply += `*${day}*\n`;
-                  for (const s of byDay[day]) {
-                    reply += `  ${s.startTime}–${s.endTime}  ${s.goalText}\n`;
-                  }
-                  reply += "\n";
+                const lines = events.map((event, index) => formatEventLine(event, index));
+                reply = weekHeader + "\n\n🗓️ *This Week's Events:*\n\n" + lines.join("\n");
+              }
+            }
+          }
+        } else if (/^\/today$/i.test(text)) {
+          const today = getCurrentDate();
+          const todayDate = new Date(today + "T00:00:00");
+          const options = {weekday: "long", month: "short", day: "numeric", year: "numeric"};
+          reply = `📆 Today: ${todayDate.toLocaleDateString("en-US", options)}`;
+        } else if (/^\/tplan(\b.*)?$/i.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists) {
+            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            if (!uid) {
+              reply = "❌ Your account is pending verification. Try again later.";
+            } else {
+              const trailingText = text.replace(/^\/tplan\s*/i, "").trim();
+              const apiKey = process.env.LLM_API_KEY;
+              if (!apiKey) {
+                reply = "❌ LLM is not configured.";
+              } else {
+                const contextPrompt = await buildContextPrompt(uid, "tplan", trailingText);
+                const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiKey}`,
+                  },
+                  body: JSON.stringify({
+                    model: "big-pickle",
+                    messages: [
+                      {role: "system", content: BASE_SYSTEM_PROMPT},
+                      {role: "user", content: contextPrompt.userMessage},
+                    ],
+                    tools: TOOLS,
+                    tool_choice: "auto",
+                  }),
+                });
+                if (response.ok) {
+                  const data = await response.json();
+                  reply = data.choices?.[0]?.message?.content || "✅ Done.";
+                } else {
+                  reply = "❌ AI service unavailable.";
                 }
               }
             }
           }
-        } else if (/^\/plan\s+/i.test(text)) {
+        } else if (/^\/goals(\b.*)?$/i.test(text)) {
           const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
           if (!userDoc.exists) {
             reply = "❌ You haven't linked your account yet. Use /link <email>";
@@ -455,106 +915,187 @@ exports.telegramWebhook = onRequest(
             if (!uid) {
               reply = "❌ Your account is pending verification. Try again later.";
             } else {
-              const goalsText = text.replace(/^\/plan\s+/i, "").trim();
-
-              const apiKey = llmApiKey.value() || process.env.LLM_API_KEY;
+              const goals = await fetchMainGoalsForUser(uid);
+              const currentGoals = goals.filter((goal) => goal.status !== "done");
+              if (currentGoals.length === 0) {
+                reply = "📋 No main goals set yet.";
+              } else {
+                const lines = currentGoals.map((goal, index) => formatMainGoal(goal, index));
+                reply = "📋 *Main Goals:*\n\n" + lines.join("\n");
+              }
+            }
+          }
+        } else if (/^\/events(\b.*)?$/i.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists) {
+            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            if (!uid) {
+              reply = "❌ Your account is pending verification. Try again later.";
+            } else {
+              const events = await fetchEventsFromToday(uid);
+              if (events.length === 0) {
+                reply = "🗓️ No upcoming events.";
+              } else {
+                const lines = events.map((event, index) => formatEventLine(event, index));
+                reply = "🗓️ *Upcoming Events:*\n\n" + lines.join("\n");
+              }
+            }
+          }
+        } else if (/^\/targets(\b.*)?$/i.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists) {
+            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            if (!uid) {
+              reply = "❌ Your account is pending verification. Try again later.";
+            } else {
+              const targets = await fetchTargetsForUser(uid, ["current", "recurring"]);
+              if (targets.length === 0) {
+                reply = "🎯 No current targets set.";
+              } else {
+                const lines = targets.map((target, index) => formatTargetLine(target, index));
+                reply = "🎯 *Current Targets:*\n\n" + lines.join("\n");
+              }
+            }
+          }
+        } else if (/^\/plan(\b.*)?$/i.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists) {
+            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            if (!uid) {
+              reply = "❌ Your account is pending verification. Try again later.";
+            } else {
+              const trailingText = text.replace(/^\/plan\s*/i, "").trim();
+              const apiKey = process.env.LLM_API_KEY;
               if (!apiKey) {
                 reply = "❌ LLM is not configured.";
               } else {
-                try {
-                  const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                      "Authorization": `Bearer ${apiKey}`,
-                    },
-                    body: JSON.stringify({
-                      model: "big-pickle",
-                      messages: [
-                        {
-                          role: "system",
-                          content: "You are a planning assistant for Schedule AI. When a user describes their goals for the week, you should:\n" +
-                            "1. Create a weekly goal for each distinct goal using the createWeeklyGoal tool\n" +
-                            "2. Then call generateSchedule with method='rule' to create a schedule\n" +
-                            "First, figure out the current week's Monday (ISO date) and use it as weekOf.\n" +
-                            "Report back what goals were created and show the schedule.",
-                        },
-                        {
-                          role: "user",
-                          content: `User's goals: ${goalsText}\n\nCurrent week Monday: ${getCurrentWeekMonday()}`,
-                        },
-                      ],
-                      tools: TOOLS,
-                      tool_choice: "auto",
-                    }),
-                  });
-
-                  if (!response.ok) {
-                    const errorText = await response.text();
-                    logger.error(`Telegram /plan LLM error: ${response.status} ${errorText}`);
-                    reply = "❌ Sorry, the AI service is unavailable. Please try again later.";
-                  } else {
-                    const data = await response.json();
-                    const choice = data.choices?.[0]?.message;
-
-                    if (choice?.tool_calls && choice.tool_calls.length > 0) {
-                      // Execute tools
-                      const toolResults = [];
-                      for (const toolCall of choice.tool_calls) {
-                        const result = await handleToolCall(toolCall, uid);
-                        toolResults.push(result);
-                      }
-
-                      // Get final response from LLM
-                      const followUpResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-                        method: "POST",
-                        headers: {
-                          "Content-Type": "application/json",
-                          "Authorization": `Bearer ${apiKey}`,
-                        },
-                        body: JSON.stringify({
-                          model: "big-pickle",
-                          messages: [
-                            {
-                              role: "system",
-                              content: "You are a planning assistant for Schedule AI.",
-                            },
-                            ...(toolResults.map((tr) => ({
-                              role: "tool",
-                              tool_call_id: tr.toolCallId,
-                              content: JSON.stringify(tr.result),
-                            }))),
-                            {
-                              role: "user",
-                              content: "Summarize what was created and show me the schedule.",
-                            },
-                          ],
-                        }),
-                      });
-
-                      if (followUpResponse.ok) {
-                        const followUpData = await followUpResponse.json();
-                        reply = followUpData.choices?.[0]?.message?.content || "✅ Plan generated!";
-                      } else {
-                        reply = "✅ Goals created and plan generated! Check your dashboard for details.";
-                      }
-                    } else {
-                      reply = choice?.content || "✅ Plan generated!";
-                    }
-                  }
-                } catch (err) {
-                  logger.error("Telegram /plan error", err);
-                  reply = "❌ Sorry, something went wrong while generating your plan.";
+                const contextPrompt = await buildContextPrompt(uid, "plan", trailingText);
+                const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiKey}`,
+                  },
+                  body: JSON.stringify({
+                    model: "big-pickle",
+                    messages: [
+                      {role: "system", content: BASE_SYSTEM_PROMPT},
+                      {role: "user", content: contextPrompt.userMessage},
+                    ],
+                    tools: TOOLS,
+                    tool_choice: "auto",
+                  }),
+                });
+                if (response.ok) {
+                  const data = await response.json();
+                  reply = data.choices?.[0]?.message?.content || "✅ Done.";
+                } else {
+                  reply = "❌ AI service unavailable.";
                 }
               }
+            }
+          }
+        } else if (/^\/archive$/i.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists) {
+            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            if (!uid) {
+              reply = "❌ Your account is pending verification. Try again later.";
+            } else {
+              const today = getCurrentDate();
+              const weekOf = getCurrentWeekMonday();
+              const weekEnd = getCurrentWeekSunday();
+              const weekStartMs = new Date(weekOf + "T00:00:00").getTime();
+              const weekEndMs = new Date(weekEnd + "T00:00:00").getTime();
+              let targetsArchived = 0;
+              let eventsArchived = 0;
+              let goalsArchived = 0;
+
+              // Archive current targets
+              const targetsSnap = await db.collection("users").doc(String(uid)).collection("targets")
+                  .where("status", "==", "current")
+                  .get();
+              const goalsSnap = await db.collection("users").doc(String(uid)).collection("goals").get();
+              const goalsMap = {};
+              goalsSnap.forEach((doc) => { goalsMap[doc.id] = doc.data(); });
+
+              for (const tDoc of targetsSnap.docs) {
+                const t = tDoc.data();
+                const goal = t.mainGoalId ? goalsMap[t.mainGoalId] : null;
+                await db.collection("archives").add({
+                  userId: uid,
+                  type: "target",
+                  name: t.text,
+                  weekStart: weekStartMs,
+                  weekEnd: weekEndMs,
+                  goalId: t.mainGoalId || null,
+                  goalTitle: goal ? goal.title : null,
+                  archivedAt: FieldValue.serverTimestamp(),
+                });
+                await tDoc.ref.delete();
+                targetsArchived++;
+              }
+
+              // Archive past events
+              const eventsSnap = await db.collection("users").doc(String(uid)).collection("events")
+                  .where("date", "<", today)
+                  .get();
+              for (const eDoc of eventsSnap.docs) {
+                const e = eDoc.data();
+                const eDateMs = new Date(e.date + "T00:00:00").getTime();
+                await db.collection("archives").add({
+                  userId: uid,
+                  type: "event",
+                  name: e.title,
+                  weekStart: eDateMs,
+                  weekEnd: eDateMs,
+                  archivedAt: FieldValue.serverTimestamp(),
+                });
+                await eDoc.ref.delete();
+                eventsArchived++;
+              }
+
+              // Archive completed goals
+              const doneGoalsSnap = await db.collection("users").doc(String(uid)).collection("goals")
+                  .where("status", "==", "done")
+                  .get();
+              for (const gDoc of doneGoalsSnap.docs) {
+                const g = gDoc.data();
+                await db.collection("archives").add({
+                  userId: uid,
+                  type: "goal",
+                  name: g.title,
+                  weekStart: weekStartMs,
+                  weekEnd: weekEndMs,
+                  archivedAt: FieldValue.serverTimestamp(),
+                });
+                await gDoc.ref.delete();
+                goalsArchived++;
+              }
+
+              reply = `📦 Archived: ${targetsArchived} target(s), ${eventsArchived} event(s), ${goalsArchived} goal(s)`;
             }
           }
         } else {
         // Default: show available commands
           reply = "Commands:\n" +
           "/link <email> - Link Telegram to your account\n" +
-          "/week - Show this week's schedule\n" +
-          "/plan <goals> - Quick plan from text\n" +
+          "/today - Show today's date\n" +
+          "/goals - Show your current main goals\n" +
+          "/targets - Show your current targets\n" +
+          "/events - Show upcoming events (today onward)\n" +
+          "/week - Show current week date range and events\n" +
+          "/tplan - Generate new targets for this week\n" +
+          "/plan - Create a daily schedule from current targets\n" +
+          "/archive - Archive current targets, past events, and completed goals\n" +
           "/start - Show this help";
         }
 
@@ -577,41 +1118,161 @@ exports.telegramWebhook = onRequest(
     },
 );
 
-// ── Hello World (for testing) ──
-
-exports.helloWorld = onRequest(
-    {region: "asia-southeast1"},
-    async (request, response) => {
-  logger.info("Hello logs!", {structuredData: true});
-  response.send("Hello from Firebase!");
-});
-
 // ── Callable: chatWithLLM (used by the ChatPanel component) ──
 
 exports.chatWithLLM = onCall(
-    {maxInstances: 10, secrets: ["LLM_API_KEY"], region: "asia-southeast1"},
+    {maxInstances: 10, region: "asia-southeast1"},
     async (request) => {
       const {messages} = request.data;
       const uid = request.auth?.uid;
 
       if (!uid) {
-        return {reply: "Authentication required. Please sign in.", model: "opencode/big-pickle"};
+        return {reply: "Authentication required. Please sign in.", model: "opencode/big-pickle", systemMessage: null};
       }
       if (!messages || !Array.isArray(messages) || messages.length === 0) {
-        return {reply: "No messages provided.", model: "opencode/big-pickle"};
+        return {reply: "No messages provided.", model: "opencode/big-pickle", systemMessage: null};
       }
 
-      const apiKey = llmApiKey.value() || process.env.LLM_API_KEY;
+      const apiKey = process.env.LLM_API_KEY;
       if (!apiKey) {
         logger.error("LLM_API_KEY not configured");
-        return {reply: "LLM is not configured. Please set up the API key.", model: "opencode/big-pickle"};
+        return {reply: "LLM is not configured. Please set up the API key.", model: "opencode/big-pickle", systemMessage: null};
       }
 
       logger.info(`chatWithLLM called by user ${uid}, ${messages.length} messages`);
 
       try {
-        // Add system message about available tools if not present
-        const enhancedMessages = [...messages];
+        const conversationMessages = messages.filter((message) => message.role !== "system");
+        let enhancedMessages = [...conversationMessages];
+        const lastMsg = enhancedMessages[enhancedMessages.length - 1];
+        const lastContent = lastMsg?.role === "user" ? (lastMsg.content || "") : "";
+        let systemMessage = BASE_SYSTEM_PROMPT;
+
+        // ── /archive command ──
+        const archiveMatch = lastContent.match(/^\/archive$/i);
+        if (archiveMatch) {
+          const today = getCurrentDate();
+          const weekOf = getCurrentWeekMonday();
+          const weekEnd = getCurrentWeekSunday();
+          const weekStartMs = new Date(weekOf + "T00:00:00").getTime();
+          const weekEndMs = new Date(weekEnd + "T00:00:00").getTime();
+          let targetsArchived = 0;
+          let eventsArchived = 0;
+          let goalsArchived = 0;
+
+          // Archive current targets
+          const targetsSnap = await db.collection("users").doc(uid).collection("targets")
+              .where("status", "==", "current").get();
+          const goalsSnap = await db.collection("users").doc(uid).collection("goals").get();
+          const goalsMap = {};
+          goalsSnap.forEach((doc) => { goalsMap[doc.id] = doc.data(); });
+
+          for (const tDoc of targetsSnap.docs) {
+            const t = tDoc.data();
+            const goal = t.mainGoalId ? goalsMap[t.mainGoalId] : null;
+            await db.collection("archives").add({
+              userId: uid,
+              type: "target",
+              name: t.text,
+              weekStart: weekStartMs,
+              weekEnd: weekEndMs,
+              goalId: t.mainGoalId || null,
+              goalTitle: goal ? goal.title : null,
+              archivedAt: FieldValue.serverTimestamp(),
+            });
+            await tDoc.ref.delete();
+            targetsArchived++;
+          }
+
+          // Archive past events (today and before)
+          const eventsSnap = await db.collection("users").doc(uid).collection("events")
+              .where("date", "<=", today).get();
+          for (const eDoc of eventsSnap.docs) {
+            const e = eDoc.data();
+            await db.collection("archives").add({
+              userId: uid,
+              type: "event",
+              name: e.title,
+              weekStart: new Date(e.date + "T00:00:00").getTime(),
+              weekEnd: new Date(e.date + "T00:00:00").getTime(),
+              archivedAt: FieldValue.serverTimestamp(),
+            });
+            await eDoc.ref.delete();
+            eventsArchived++;
+          }
+
+          // Archive completed goals
+          const doneGoalsSnap = await db.collection("users").doc(uid).collection("goals")
+              .where("status", "==", "done").get();
+          for (const gDoc of doneGoalsSnap.docs) {
+            await db.collection("archives").add({
+              userId: uid,
+              type: "goal",
+              name: gDoc.data().title,
+              weekStart: weekStartMs,
+              weekEnd: weekEndMs,
+              archivedAt: FieldValue.serverTimestamp(),
+            });
+            await gDoc.ref.delete();
+            goalsArchived++;
+          }
+
+          return {
+            reply: `📦 Archived: ${targetsArchived} target(s), ${eventsArchived} event(s), ${goalsArchived} goal(s)`,
+            model: "archive",
+            systemMessage: null,
+            steps: [
+              {tool: "ArchiveTargets"},
+              {tool: "ArchiveEvents"},
+              {tool: "ArchiveMainGoals"},
+            ],
+          };
+        }
+
+        // ── /tplan command ──
+        const tplanMatch = lastContent.match(/^\/tplan\b\s*(.*)$/i);
+        if (tplanMatch) {
+          const trailingText = tplanMatch[1]?.trim() || "";
+          const contextPrompt = await buildContextPrompt(uid, "tplan", trailingText);
+          enhancedMessages = [
+            {role: "system", content: BASE_SYSTEM_PROMPT},
+            ...enhancedMessages,
+            {role: "user", content: contextPrompt.userMessage},
+          ];
+          systemMessage = BASE_SYSTEM_PROMPT;
+        // ── /plan command ──
+        } else {
+          const planMatch = lastContent.match(/^\/plan\b\s*(.*)$/i);
+          if (planMatch) {
+            const trailingText = planMatch[1]?.trim() || "";
+            const contextPrompt = await buildContextPrompt(uid, "plan", trailingText);
+            enhancedMessages = [
+              {role: "system", content: BASE_SYSTEM_PROMPT},
+              ...enhancedMessages,
+              {role: "user", content: contextPrompt.userMessage},
+            ];
+            systemMessage = BASE_SYSTEM_PROMPT;
+          } else {
+            const commandMatch = lastContent.match(/^\/(goals|events|targets)\b\s*(.*)$/i);
+            if (commandMatch) {
+              const command = commandMatch[1]?.toLowerCase();
+              const trailingText = commandMatch[2]?.trim() || "";
+              const contextPrompt = await buildContextPrompt(uid, command, trailingText);
+              enhancedMessages = [
+                {role: "system", content: BASE_SYSTEM_PROMPT},
+                ...enhancedMessages,
+                {role: "user", content: contextPrompt.userMessage},
+              ];
+              systemMessage = BASE_SYSTEM_PROMPT;
+            } else {
+              enhancedMessages = [
+                {role: "system", content: BASE_SYSTEM_PROMPT},
+                ...enhancedMessages,
+              ];
+              systemMessage = BASE_SYSTEM_PROMPT;
+            }
+          }
+        }
 
         const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
           method: "POST",
@@ -633,25 +1294,51 @@ exports.chatWithLLM = onCall(
           return {
             reply: `Sorry, the AI service returned an error (${response.status}). Please try again later.`,
             model: "opencode/big-pickle",
+            systemMessage,
           };
         }
 
         const data = await response.json();
         const choice = data.choices?.[0]?.message;
 
+        logger.info(`LLM response: tool_calls=${JSON.stringify(choice?.tool_calls?.length || 0)}, content_length=${(choice?.content || "").length}, finish_reason=${data.choices?.[0]?.finish_reason}`);
+
+        // Resolve tool calls: prefer native API format, fall back to XML parsing
+        let toolCalls = choice?.tool_calls && choice.tool_calls.length > 0
+          ? choice.tool_calls
+          : parseXmlToolCalls(choice?.content || "");
+
         // Check if the LLM wants to call tools
-        if (choice?.tool_calls && choice.tool_calls.length > 0) {
+        if (toolCalls.length > 0) {
+          logger.info(`Executing ${toolCalls.length} tool call(s):`, toolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
+
           // Execute all tool calls
           const toolResults = [];
-          for (const toolCall of choice.tool_calls) {
+          const steps = [];
+          const toolOutputs = [];
+          for (const toolCall of toolCalls) {
             const result = await handleToolCall(toolCall, uid);
             toolResults.push(result);
+            steps.push({tool: `${toolCall.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+            const output = formatToolResult(toolCall.function.name, result.result);
+            if (output) toolOutputs.push(output);
           }
 
-          // Send tool results back to the LLM for a final response
-          const followUpMessages = [
+          // Strip XML tool call blocks from content before follow-up
+          let cleanContent = choice?.content || "";
+          if (choice?.tool_calls === undefined || (choice?.tool_calls && choice.tool_calls.length === 0)) {
+            cleanContent = cleanContent.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
+          }
+
+          // Build assistant message with proper tool_calls format
+          const assistantMsg = choice?.tool_calls && choice.tool_calls.length > 0
+            ? {role: "assistant", content: choice.content || null, tool_calls: choice.tool_calls}
+            : {role: "assistant", content: cleanContent || "Let me check that for you."};
+
+          // Initial conversation for follow-up rounds
+          let conversationMessages = [
             ...enhancedMessages,
-            choice,
+            assistantMsg,
             ...toolResults.map((tr) => ({
               role: "tool",
               tool_call_id: tr.toolCallId,
@@ -659,41 +1346,128 @@ exports.chatWithLLM = onCall(
             })),
           ];
 
-          const followUpResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify({
-              model: "big-pickle",
-              messages: followUpMessages,
-            }),
-          });
+          // Multi-step tool loop: up to 5 rounds of tool execution
+          let finalReply = null;
+          for (let round = 0; round < 5; round++) {
+            const body = {model: "big-pickle", messages: conversationMessages, tools: TOOLS};
 
-          if (!followUpResponse.ok) {
-            const errorText = await followUpResponse.text();
-            logger.error(`OpenCode Zen API follow-up error: ${followUpResponse.status} ${errorText}`);
-            // Fall back: return a summary of what was done
-            const summaries = toolResults.map((tr) => tr.result.summary || JSON.stringify(tr.result)).join("\n");
-            return {reply: `I've completed the following actions:\n${summaries}`, model: "opencode/big-pickle"};
+            const followUpResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`,
+              },
+              body: JSON.stringify(body),
+            });
+
+            if (!followUpResponse.ok) {
+              const errorText = await followUpResponse.text();
+              logger.error(`OpenCode Zen API follow-up error: ${followUpResponse.status} ${errorText}`);
+              const summaries = steps.map((s) => s.tool).join("\n");
+              const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
+              return {reply: `${listPrefix}I've completed the following actions:\n${summaries}`, steps, model: "opencode/big-pickle", systemMessage};
+            }
+
+            const data = await followUpResponse.json();
+            const msg = data.choices?.[0]?.message;
+            const nextToolCalls = msg?.tool_calls && msg.tool_calls.length > 0
+              ? msg.tool_calls
+              : parseXmlToolCalls(msg?.content || "");
+
+            // No more tool calls — return text response
+            if (nextToolCalls.length === 0) {
+              finalReply = msg?.content || "Actions completed.";
+              break;
+            }
+
+            // Execute next round of tool calls
+            logger.info(`Round ${round + 2}: executing ${nextToolCalls.length} tool call(s):`, nextToolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
+
+            const nextAssistantMsg = msg?.tool_calls && msg.tool_calls.length > 0
+              ? {role: "assistant", content: msg.content || null, tool_calls: msg.tool_calls}
+              : {role: "assistant", content: msg?.content || ""};
+
+            conversationMessages = [
+              ...conversationMessages,
+              nextAssistantMsg,
+            ];
+
+            for (const tc of nextToolCalls) {
+              const result = await handleToolCall(tc, uid);
+              steps.push({tool: `${tc.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+              const output = formatToolResult(tc.function.name, result.result);
+              if (output) toolOutputs.push(output);
+              conversationMessages.push({
+                role: "tool",
+                tool_call_id: result.toolCallId,
+                content: JSON.stringify(result.result),
+              });
+            }
           }
 
-          const followUpData = await followUpResponse.json();
-          const followUpReply = followUpData.choices?.[0]?.message?.content || "Actions completed.";
-          return {reply: followUpReply, model: "opencode/big-pickle"};
+          // Force a summary response if the loop ended without a text reply
+          if (!finalReply) {
+            conversationMessages.push({role: "user", content: "Summarize what you just did for the user in a natural, friendly way."});
+            const summaryResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`,
+              },
+              body: JSON.stringify({model: "big-pickle", messages: conversationMessages}),
+            });
+            if (summaryResponse.ok) {
+              const summaryData = await summaryResponse.json();
+              finalReply = summaryData.choices?.[0]?.message?.content || "Actions completed.";
+            } else {
+              const summaries = steps.map((s) => s.tool).join("\n");
+              finalReply = `I've completed the following actions:\n${summaries}`;
+            }
+          }
+
+          const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
+          return {reply: `${listPrefix}${finalReply || "Actions completed."}`, steps, model: "opencode/big-pickle", systemMessage};
         }
 
         // No tool calls — return the LLM's text response as before
         const reply = choice?.content || "No response from AI.";
         logger.info(`chatWithLLM success for user ${uid}`);
-        return {reply, model: "opencode/big-pickle"};
+        return {reply, model: "opencode/big-pickle", systemMessage};
       } catch (err) {
         logger.error("chatWithLLM fetch error", err);
         return {
           reply: "Sorry, an error occurred while contacting the AI service. Please check your network and try again.",
           model: "opencode/big-pickle",
+          systemMessage: null,
         };
       }
+    },
+);
+
+// ── Debug: getPromptTemplate (emulator only) ──
+
+exports.debugGetPromptTemplate = onRequest(
+    {region: "asia-southeast1"},
+    async (req, res) => {
+      const host = req.headers.host || "";
+      if (!host.includes("localhost") && !host.includes("127.0.0.1")) {
+        res.status(403).json({error: "Emulator only"});
+        return;
+      }
+
+      const command = req.query.command;
+      if (!command) {
+        res.status(400).json({error: "Missing ?command= parameter"});
+        return;
+      }
+
+      const snap = await rtdb.ref(`prompts/${command}`).once("value");
+      const template = snap.val();
+      if (!template) {
+        res.status(404).json({error: `No template found at prompts/${command}`});
+        return;
+      }
+
+      res.json({command, template});
     },
 );

@@ -1,9 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import {
   collection,
-  query,
-  where,
-  getDocs,
   addDoc,
   updateDoc,
   deleteDoc,
@@ -12,13 +9,15 @@ import {
 } from "firebase/firestore";
 import { db } from "../lib/firebase";
 import { MainGoal, MainGoalStatus } from "../types";
+import Modal from "./Modal";
 
 interface MainGoalListProps {
   userId: string;
+  mainGoals: MainGoal[];
+  onMainGoalsChange: () => void;
 }
 
-export default function MainGoalList({ userId }: MainGoalListProps) {
-  const [mainGoals, setMainGoals] = useState<MainGoal[]>([]);
+export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: MainGoalListProps) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [targetDate, setTargetDate] = useState("");
@@ -29,29 +28,26 @@ export default function MainGoalList({ userId }: MainGoalListProps) {
   const [editDescription, setEditDescription] = useState("");
   const [editTargetDate, setEditTargetDate] = useState("");
   const [editStatus, setEditStatus] = useState<MainGoalStatus>("not_started");
+  const [deleteGoalId, setDeleteGoalId] = useState<string | null>(null);
+  const [deleteGoalName, setDeleteGoalName] = useState("");
+  const [optimisticStatuses, setOptimisticStatuses] = useState<Record<string, MainGoalStatus>>({});
+  const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+
+  const STATUS_CYCLE: Record<MainGoalStatus, MainGoalStatus> = {
+    not_started: "in_progress",
+    in_progress: "done",
+    done: "not_started",
+  };
 
   useEffect(() => {
-    fetchMainGoals();
-  }, [userId]);
-
-  async function fetchMainGoals() {
-    const q = query(
-      collection(db, "mainGoals"),
-      where("userId", "==", userId),
-    );
-    const snap = await getDocs(q);
-    const list: MainGoal[] = [];
-    snap.forEach((d) => {
-      const data = d.data() as Omit<MainGoal, "id">;
-      list.push({ id: d.id, ...data });
-    });
-    setMainGoals(list);
-  }
+    return () => {
+      Object.values(saveTimers.current).forEach(clearTimeout);
+    };
+  }, []);
 
   async function addMainGoal() {
     if (!title.trim()) return;
-    await addDoc(collection(db, "mainGoals"), {
-      userId,
+    await addDoc(collection(db, "users", userId, "goals"), {
       title: title.trim(),
       description: description.trim() || null,
       targetDate: targetDate || null,
@@ -63,7 +59,7 @@ export default function MainGoalList({ userId }: MainGoalListProps) {
     setTargetDate("");
     setStatus("not_started");
     setShowForm(false);
-    fetchMainGoals();
+    onMainGoalsChange();
   }
 
   function startEdit(goal: MainGoal) {
@@ -84,20 +80,47 @@ export default function MainGoalList({ userId }: MainGoalListProps) {
 
   async function saveEdit(id: string) {
     if (!editTitle.trim()) return;
-    await updateDoc(doc(db, "mainGoals", id), {
+    await updateDoc(doc(db, "users", userId, "goals", id), {
       title: editTitle.trim(),
       description: editDescription.trim() || null,
       targetDate: editTargetDate || null,
       status: editStatus,
     });
     setEditingId(null);
-    fetchMainGoals();
+    onMainGoalsChange();
   }
 
-  async function removeMainGoal(id: string) {
-    if (!window.confirm("Are you sure?")) return;
-    await deleteDoc(doc(db, "mainGoals", id));
-    fetchMainGoals();
+  function confirmDelete(goal: MainGoal) {
+    setDeleteGoalId(goal.id ?? null);
+    setDeleteGoalName(goal.title);
+  }
+
+  function handleStatusCycle(goal: MainGoal) {
+    const nextStatus = STATUS_CYCLE[goal.status];
+
+    setOptimisticStatuses((prev) => ({ ...prev, [goal.id!]: nextStatus }));
+
+    if (saveTimers.current[goal.id!]) {
+      clearTimeout(saveTimers.current[goal.id!]);
+    }
+
+    saveTimers.current[goal.id!] = setTimeout(async () => {
+      await updateDoc(doc(db, "users", userId, "goals", goal.id!), { status: nextStatus });
+      await onMainGoalsChange();
+      setOptimisticStatuses((prev) => {
+        const next = { ...prev };
+        delete next[goal.id!];
+        return next;
+      });
+      delete saveTimers.current[goal.id!];
+    }, 2000);
+  }
+
+  async function executeDelete() {
+    if (!deleteGoalId) return;
+    await deleteDoc(doc(db, "users", userId, "goals", deleteGoalId));
+    setDeleteGoalId(null);
+    onMainGoalsChange();
   }
 
   function formatDate(dateStr: string): string {
@@ -127,22 +150,82 @@ export default function MainGoalList({ userId }: MainGoalListProps) {
     );
   }
 
+  function goalAccent(status: MainGoalStatus) {
+    const accents: Record<MainGoalStatus, string> = {
+      not_started: "border-l-red-400",
+      in_progress: "border-l-amber-400",
+      done: "border-l-green-400",
+    };
+    return accents[status];
+  }
+
+  function renderGoalCard(goal: MainGoal) {
+    const displayStatus = optimisticStatuses[goal.id!] || goal.status;
+    return (
+      <div
+        key={goal.id}
+        onDoubleClick={() => handleStatusCycle(goal)}
+        className={`min-w-[240px] max-w-[280px] h-[280px] shrink-0 bg-white border border-l-4 ${goalAccent(displayStatus)} rounded-lg shadow-sm p-4 flex flex-col overflow-hidden select-none`}
+      >
+        <div className="flex items-start justify-between mb-2">
+          <span className="font-semibold text-base leading-tight">{goal.title}</span>
+          <div className="flex items-center gap-0.5 ml-2 shrink-0">
+            <button
+              onClick={() => startEdit(goal)}
+              className="text-gray-400 hover:text-gray-700 text-xs px-1"
+              title="Edit"
+            >
+              ✎
+            </button>
+            <button
+              onClick={() => confirmDelete(goal)}
+              className="text-gray-400 hover:text-red-600 text-xs px-1"
+              title="Delete"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+
+        {statusBadge(displayStatus)}
+
+        {goal.description && (
+          <p className="text-sm text-gray-500 mt-2 overflow-y-auto">{goal.description}</p>
+        )}
+
+        {goal.targetDate && (
+          <p className="text-xs text-gray-400 mt-auto pt-2">
+            Target: {formatDate(goal.targetDate)}
+          </p>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="bg-white rounded-lg shadow-sm border p-4">
-      {/* Header */}
       <div className="flex items-center justify-between mb-3">
         <h2 className="font-semibold text-lg">Main Goals</h2>
         <button
-          onClick={() => setShowForm(!showForm)}
+          onClick={() => setShowForm(true)}
           className="bg-green-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-green-700 transition"
         >
-          {showForm ? "Cancel" : "+ Add Main Goal"}
+          + Add Main Goal
         </button>
       </div>
 
-      {/* Add Form */}
-      {showForm && (
-        <div className="space-y-2 mb-4 border rounded p-3 bg-gray-50">
+      <div className="flex gap-4 overflow-x-auto pb-2">
+        {mainGoals.map((goal) => renderGoalCard(goal))}
+        {mainGoals.length === 0 && (
+          <p className="text-gray-400 text-sm">
+            No main goals yet. Add a long-term goal to get started!
+          </p>
+        )}
+      </div>
+
+      {/* Add Modal */}
+      <Modal open={showForm} onClose={() => setShowForm(false)} title="Add Main Goal">
+        <div className="space-y-3">
           <input
             type="text"
             placeholder="Goal title"
@@ -188,105 +271,78 @@ export default function MainGoalList({ userId }: MainGoalListProps) {
             </button>
           </div>
         </div>
-      )}
+      </Modal>
 
-      {/* Goal Cards */}
-      <div className="space-y-2 max-h-64 overflow-y-auto">
-        {mainGoals.map((goal) => (
-          <div key={goal.id} className="border rounded p-3">
-            {editingId === goal.id ? (
-              /* Edit Mode */
-              <div className="space-y-2">
-                <input
-                  type="text"
-                  value={editTitle}
-                  onChange={(e) => setEditTitle(e.target.value)}
-                  className="w-full border rounded px-2 py-1 text-sm"
-                  placeholder="Goal title"
-                />
-                <textarea
-                  value={editDescription}
-                  onChange={(e) => setEditDescription(e.target.value)}
-                  className="w-full border rounded px-2 py-1 text-sm resize-none"
-                  rows={2}
-                  placeholder="Description (optional)"
-                />
-                <input
-                  type="date"
-                  value={editTargetDate}
-                  onChange={(e) => setEditTargetDate(e.target.value)}
-                  className="w-full border rounded px-2 py-1 text-sm"
-                />
-                <select
-                  value={editStatus}
-                  onChange={(e) => setEditStatus(e.target.value as MainGoalStatus)}
-                  className="w-full border rounded px-2 py-1 text-sm"
-                >
-                  <option value="not_started">Not Started</option>
-                  <option value="in_progress">In Progress</option>
-                  <option value="done">Done</option>
-                </select>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => goal.id && saveEdit(goal.id)}
-                    disabled={!editTitle.trim()}
-                    className="flex-1 bg-green-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition"
-                  >
-                    Save
-                  </button>
-                  <button
-                    onClick={cancelEdit}
-                    className="flex-1 bg-gray-400 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-gray-500 transition"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            ) : (
-              /* Display Mode */
-              <div>
-                <div className="flex items-start justify-between">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="font-medium text-base">{goal.title}</span>
-                      {statusBadge(goal.status)}
-                    </div>
-                    {goal.description && (
-                      <p className="text-sm text-gray-600 truncate">{goal.description}</p>
-                    )}
-                    {goal.targetDate && (
-                      <p className="text-xs text-gray-500 mt-1">
-                        Target: {formatDate(goal.targetDate)}
-                      </p>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-1 ml-2">
-                    <button
-                      onClick={() => startEdit(goal)}
-                      className="text-gray-500 hover:text-gray-700 text-xs px-1"
-                      title="Edit"
-                    >
-                      ✎
-                    </button>
-                    <button
-                      onClick={() => goal.id && removeMainGoal(goal.id)}
-                      className="text-red-500 hover:text-red-700 text-xs"
-                      title="Delete"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
+      {/* Edit Modal */}
+      <Modal open={!!editingId} onClose={cancelEdit} title="Edit Main Goal">
+        <div className="space-y-3">
+          <input
+            type="text"
+            value={editTitle}
+            onChange={(e) => setEditTitle(e.target.value)}
+            className="w-full border rounded px-2 py-1 text-sm"
+            placeholder="Goal title"
+          />
+          <textarea
+            value={editDescription}
+            onChange={(e) => setEditDescription(e.target.value)}
+            className="w-full border rounded px-2 py-1 text-sm resize-none"
+            rows={2}
+            placeholder="Description (optional)"
+          />
+          <input
+            type="date"
+            value={editTargetDate}
+            onChange={(e) => setEditTargetDate(e.target.value)}
+            className="w-full border rounded px-2 py-1 text-sm"
+          />
+          <select
+            value={editStatus}
+            onChange={(e) => setEditStatus(e.target.value as MainGoalStatus)}
+            className="w-full border rounded px-2 py-1 text-sm"
+          >
+            <option value="not_started">Not Started</option>
+            <option value="in_progress">In Progress</option>
+            <option value="done">Done</option>
+          </select>
+          <div className="flex gap-2">
+            <button
+              onClick={() => editingId && saveEdit(editingId)}
+              disabled={!editTitle.trim()}
+              className="flex-1 bg-green-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition"
+            >
+              Save
+            </button>
+            <button
+              onClick={cancelEdit}
+              className="flex-1 bg-gray-400 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-gray-500 transition"
+            >
+              Cancel
+            </button>
           </div>
-        ))}
-        {mainGoals.length === 0 && (
-          <p className="text-gray-400 text-sm">
-            No main goals yet. Add a long-term goal to get started!
-          </p>
-        )}
-      </div>
+        </div>
+      </Modal>
+
+      {/* Delete Confirmation Modal */}
+      <Modal open={!!deleteGoalId} onClose={() => setDeleteGoalId(null)} title="Confirm Delete">
+        <p className="text-sm text-gray-600 mb-4">
+          Are you sure you want to delete <strong>"{deleteGoalName}"</strong>?
+        </p>
+        <div className="flex gap-2">
+          <button
+            onClick={executeDelete}
+            className="flex-1 bg-red-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-red-700 transition"
+          >
+            Delete
+          </button>
+          <button
+            onClick={() => setDeleteGoalId(null)}
+            className="flex-1 bg-gray-400 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-gray-500 transition"
+          >
+            Cancel
+          </button>
+        </div>
+      </Modal>
     </div>
   );
 }

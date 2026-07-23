@@ -1,8 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo, forwardRef, useImperativeHandle } from "react";
 import {
   collection,
-  query,
-  where,
   getDocs,
   addDoc,
   deleteDoc,
@@ -11,43 +9,53 @@ import {
 } from "firebase/firestore";
 import { db } from "../lib/firebase";
 import { CalendarEvent } from "../types";
+import Modal from "./Modal";
 
 interface EventListProps {
   userId: string;
   weekOf: string;
+  weekEnd: string;
 }
 
-export default function EventList({ userId, weekOf }: EventListProps) {
-  const [events, setEvents] = useState<CalendarEvent[]>([]);
+export interface EventListHandle {
+  refresh: () => void;
+}
+
+const EventList = forwardRef<EventListHandle, EventListProps>(({ userId, weekOf, weekEnd }, ref) => {
+  const [allEvents, setAllEvents] = useState<CalendarEvent[]>([]);
   const [title, setTitle] = useState("");
   const [date, setDate] = useState("");
   const [startTime, setStartTime] = useState("09:00");
   const [endTime, setEndTime] = useState("10:00");
-
-  useEffect(() => {
-    fetchEvents();
-  }, [userId, weekOf]);
+  const [showForm, setShowForm] = useState(false);
+  const [deleteEventId, setDeleteEventId] = useState<string | null>(null);
+  const [deleteEventName, setDeleteEventName] = useState("");
 
   async function fetchEvents() {
-    const q = query(
-      collection(db, "events"),
-      where("userId", "==", userId),
-      where("date", ">=", weekOf),
-    );
-    const snap = await getDocs(q);
+    const snap = await getDocs(collection(db, "users", userId, "events"));
     const list: CalendarEvent[] = [];
     snap.forEach((d) => {
       const data = d.data() as Omit<CalendarEvent, "id">;
       list.push({ id: d.id, ...data });
     });
-    list.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
-    setEvents(list);
+    setAllEvents(list);
   }
+
+  useImperativeHandle(ref, () => ({ refresh: fetchEvents }));
+
+  useEffect(() => {
+    fetchEvents();
+  }, [userId]);
+
+  const events = useMemo(() => {
+    return allEvents
+      .filter((e) => e.date >= weekOf && e.date <= weekEnd)
+      .sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
+  }, [allEvents, weekOf, weekEnd]);
 
   async function addEvent() {
     if (!title.trim() || !date) return;
-    await addDoc(collection(db, "events"), {
-      userId,
+    await addDoc(collection(db, "users", userId, "events"), {
       title: title.trim(),
       date,
       startTime,
@@ -58,51 +66,29 @@ export default function EventList({ userId, weekOf }: EventListProps) {
     setDate("");
     setStartTime("09:00");
     setEndTime("10:00");
+    setShowForm(false);
     fetchEvents();
   }
 
-  async function removeEvent(id: string) {
-    await deleteDoc(doc(db, "events", id));
+  function confirmDelete(event: CalendarEvent) {
+    setDeleteEventId(event.id ?? null);
+    setDeleteEventName(event.title);
+  }
+
+  async function executeDelete() {
+    if (!deleteEventId) return;
+    await deleteDoc(doc(db, "users", userId, "events", deleteEventId));
+    setDeleteEventId(null);
     fetchEvents();
   }
 
   return (
     <div className="bg-white rounded-lg shadow-sm border p-4">
-      <h2 className="font-semibold text-lg mb-3">Events</h2>
-
-      <div className="space-y-2 mb-4">
-        <input
-          type="text"
-          placeholder="Event title"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          className="w-full border rounded px-2 py-1 text-sm"
-        />
-        <input
-          type="date"
-          value={date}
-          onChange={(e) => setDate(e.target.value)}
-          className="w-full border rounded px-2 py-1 text-sm"
-        />
-        <div className="flex gap-2">
-          <input
-            type="time"
-            value={startTime}
-            onChange={(e) => setStartTime(e.target.value)}
-            className="flex-1 border rounded px-2 py-1 text-sm"
-          />
-          <span className="self-center text-gray-400">to</span>
-          <input
-            type="time"
-            value={endTime}
-            onChange={(e) => setEndTime(e.target.value)}
-            className="flex-1 border rounded px-2 py-1 text-sm"
-          />
-        </div>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="font-semibold text-lg">Events</h2>
         <button
-          onClick={addEvent}
-          disabled={!title.trim() || !date}
-          className="w-full bg-blue-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition"
+          onClick={() => setShowForm(true)}
+          className="bg-blue-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-blue-700 transition"
         >
           + Add Event
         </button>
@@ -118,7 +104,7 @@ export default function EventList({ userId, weekOf }: EventListProps) {
               </span>
             </div>
             <button
-              onClick={() => ev.id && removeEvent(ev.id)}
+              onClick={() => confirmDelete(ev)}
               className="text-red-500 hover:text-red-700 text-xs"
             >
               ✕
@@ -129,6 +115,79 @@ export default function EventList({ userId, weekOf }: EventListProps) {
           <p className="text-gray-400 text-sm">No events this week</p>
         )}
       </div>
+
+      {/* Add Modal */}
+      <Modal open={showForm} onClose={() => setShowForm(false)} title="Add Event">
+        <div className="space-y-3">
+          <input
+            type="text"
+            placeholder="Event title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="w-full border rounded px-2 py-1 text-sm"
+          />
+          <input
+            type="date"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+            className="w-full border rounded px-2 py-1 text-sm"
+          />
+          <div className="flex gap-2">
+            <input
+              type="time"
+              value={startTime}
+              onChange={(e) => setStartTime(e.target.value)}
+              className="flex-1 border rounded px-2 py-1 text-sm"
+            />
+            <span className="self-center text-gray-400">to</span>
+            <input
+              type="time"
+              value={endTime}
+              onChange={(e) => setEndTime(e.target.value)}
+              className="flex-1 border rounded px-2 py-1 text-sm"
+            />
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={addEvent}
+              disabled={!title.trim() || !date}
+              className="flex-1 bg-blue-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition"
+            >
+              Save
+            </button>
+            <button
+              onClick={() => setShowForm(false)}
+              className="flex-1 bg-gray-400 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-gray-500 transition"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Delete Confirmation Modal */}
+      <Modal open={!!deleteEventId} onClose={() => setDeleteEventId(null)} title="Confirm Delete">
+        <p className="text-sm text-gray-600 mb-4">
+          Are you sure you want to delete <strong>"{deleteEventName}"</strong>?
+        </p>
+        <div className="flex gap-2">
+          <button
+            onClick={executeDelete}
+            className="flex-1 bg-red-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-red-700 transition"
+          >
+            Delete
+          </button>
+          <button
+            onClick={() => setDeleteEventId(null)}
+            className="flex-1 bg-gray-400 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-gray-500 transition"
+          >
+            Cancel
+          </button>
+        </div>
+      </Modal>
     </div>
   );
-}
+});
+
+EventList.displayName = "EventList";
+export default EventList;

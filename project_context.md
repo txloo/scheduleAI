@@ -2,7 +2,7 @@
 
 ## Project Purpose
 
-**Schedule AI** is a web-based weekly planning and scheduling application that helps users organize their week by managing calendar events, setting goals, and generating AI-powered weekly plans. It includes a Telegram bot for interacting with plans via chat and an AI chat assistant with tool-calling capabilities.
+**Schedule AI** is a web-based weekly planning application that helps users organize their week by managing calendar events and targets. It includes an AI chat assistant with tool-calling capabilities and a Telegram bot that uses configurable prompt templates stored in Realtime Database.
 
 ---
 
@@ -17,57 +17,63 @@
 ### 2. Week Navigation
 - **WeekPicker** component lets users browse weeks (prev/next/today)
 - Displays current week range (e.g. "Jul 6 – Jul 12, 2026")
-- All data (events, goals, plans) is scoped to the selected week
+- All data (events, targets) is scoped to the selected week
 
 ### 3. Events Management
 - **EventList** component for CRUD operations on calendar events
 - Fields: title, date, start time, end time
-- Events are stored in Firestore (`events` collection)
+- Events are stored in Firestore (`users/{uid}/events` subcollection)
 - Sorted by date then time
 - Events for the selected week are fetched and displayed
+- Add and delete via Modal dialogs with confirmation
 
-### 4. Goals Management
-- **GoalList** component for CRUD operations on weekly goals
+### 4. Targets Management
+- **TargetList** component for CRUD operations on weekly targets
 - Fields: text description, priority (1–5), estimated hours
-- Goals are stored in Firestore (`goals` collection)
-- Goals can optionally be linked to a Main Goal via `mainGoalId`
+- Targets are stored in Firestore (`users/{uid}/targets` subcollection)
+- Targets can optionally be linked to a Main Goal via `mainGoalId`
 - Linked main goal title displayed as `→ Main Goal Title`
 - Sorted by priority (highest first)
+- Organized into Current and Upcoming sections
+- Inline status dropdown for quick status changes
+- Add, edit, and delete via Modal dialogs with confirmation
 
 ### 5. Main Goals Management
 - **MainGoalList** component for full CRUD operations on long-term main goals
 - Fields: title, description, target date, status (not_started / in_progress / done)
-- Main goals are stored in Firestore (`mainGoals` collection)
-- Inline edit mode with toggle between display and edit views
-- Status badges with color coding (red/amber/green)
-- Main goals are passed as context to the plan generation scheduler for future LLM-based scheduling
+- Main goals are stored in Firestore (`users/{uid}/goals` subcollection)
+- Horizontal scrolling card layout with color-coded status badges (red/amber/green)
+- Left border accent based on status
+- Add, edit, and delete via Modal dialogs with confirmation
 
-### 6. AI Weekly Plan Generation
-- **WeeklyPlan** component orchestrates AI plan generation
-- Click "Generate Weekly Plan" to call a Firebase Cloud Function
-- Cloud Function fetches events, goals, and main goals from Firestore
-- Rule-based scheduler allocates goal time into free slots between events (Mon–Sun, 09:00–18:00, max 3h per slot)
-- Plan displayed day-by-day with time slots
-- **Accept** button converts plan slots into individual events
-- **Regenerate** button re-runs plan generation
-
-### 7. AI Chat Assistant
+### 6. AI Chat Assistant
 - **ChatPanel** component provides an AI chat interface
+- Chat history pre-fetched on dashboard mount (loaded before chat opens)
 - Calls the `chatWithLLM` Cloud Function via Firebase callable
-- LLM (OpenCode Zen, `big-pickle` model) has tool-calling capabilities:
-  - `createMainGoal` — creates long-term goals in Firestore
-  - `createWeeklyGoal` — creates weekly goals in Firestore
-  - `generateSchedule` — generates schedules (rule-based or LLM-powered)
-- Sliding window: keeps system prompt + last 20 messages (10 user/assistant pairs)
+- LLM (OpenCode Zen, `big-pickle` model) has tool-calling capabilities (12 tools: CRUD for goals, targets, events + list operations)
+- Tool call steps displayed in chat as assistant messages
+- System prompt displayed in amber-styled UI element
+- Tool outputs (with IDs) prepended to replies for conversation history context
+- Sliding window: keeps welcome message + last 30 messages
 - Chat history persisted to Firebase Realtime Database at `chats/{userId}`
-- Auto-scrolls to bottom on new messages
+- Auto-scrolls to bottom on new messages (skipped on initial render)
+- `/clear` command resets chat history
+- "Test Connection" button for verifying emulator connectivity
+- `onToolAction` callback refreshes goals, targets, and events lists after AI tool calls
 
-### 8. Telegram Bot Integration
+### 7. Telegram Bot Integration
 - `/link <email>` — Link Telegram chat to Firebase user
-- `/week` — View this week's plan via Telegram
-- `/plan <goals>` — AI-powered plan generation: parses goals via LLM, creates weekly goals in Firestore, generates schedule
+- `/plan` — Fetches prompt template from RTDB `prompts/plan`, fills with user's current targets/events, sends to LLM
+- `/tplan` — Generate new targets for the week using RTDB `prompts/tplan` template
+- `/goals` — Show user's current main goals (non-done)
+- `/targets` — Show user's current/recurring targets
+- `/events` — Show this week's events
+- `/week` — Show current week date range (e.g., "Jul 14 – Jul 20, 2026")
+- `/today` — Show today's date
+- `/archive` — Archive current targets, past events, and completed goals to `archives` collection
 - `/start` — Help and welcome message
 - User mapping stored in `telegramUsers` collection
+- Prompt templates are configurable skills stored in RTDB with `systemPrompt` and `userTemplate` fields
 
 ---
 
@@ -76,9 +82,9 @@
 | Service | Usage |
 |---------|-------|
 | **Authentication** | Google Sign-In + Email/Password providers, auth state management |
-| **Cloud Firestore** | Data storage: `events`, `goals`, `mainGoals`, `plans`, `telegramUsers` collections |
-| **Realtime Database** | Chat message persistence at `chats/{userId}` |
-| **Cloud Functions** | `generateWeeklyPlan` (callable), `chatWithLLM` (callable), `telegramWebhook` (HTTP), `helloWorld` (HTTP) |
+| **Cloud Firestore** | Data storage: `users/{uid}/events`, `users/{uid}/targets`, `users/{uid}/goals` subcollections + `archives` top-level |
+| **Realtime Database** | Chat message persistence at `chats/{userId}`, prompt templates at `prompts/{command}` |
+| **Cloud Functions** | `chatWithLLM` (callable), `testConnection` (callable), `telegramWebhook` (HTTP) |
 | **Firebase Hosting** | SPA hosting of the Vite build output (`dist/`) |
 | **Firebase Emulators** | Local dev: Auth (9099), Functions (5001), Firestore (8080), Hosting (5000), Database (9000) |
 
@@ -115,18 +121,19 @@
 
 ## Data Model Summary
 
-```
-events:        userId, title, date, startTime, endTime, createdAt
-goals:         userId, text, priority (1-5), estimatedHours, weekOf, deadline?, mainGoalId?, createdAt
-mainGoals:     userId, title, description?, targetDate?, status (not_started|in_progress|done), createdAt
-plans:         userId, weekOf, generatedAt, accepted (bool), slots[]
-telegramUsers: email, chatId, linkedAt, uid?
-chats (RTDB):  chats/{userId} -> { messages[], updatedAt }
-```
+All user data is stored in per-user subcollections under `users/{uid}/`. Ownership is implicit in the path — no `userId` field is needed in individual documents.
 
-### PlanSlot (nested in plans)
 ```
-{ day, date, startTime, endTime, goalId, goalText }
+users/{uid}/
+  events/{docId}        title, date, startTime, endTime, createdAt
+  targets/{docId}       text, priority (1-5), estimatedHours, status (current|upcoming|recurring), deadline?, mainGoalId?, createdAt
+  goals/{docId}         title, description?, targetDate?, status (not_started|in_progress|done), createdAt
+
+archives/{docId}        userId, type (target|event|goal), name, weekStart, weekEnd, goalId?, goalTitle?, archivedAt
+telegramUsers/{fromId}  email, chatId, linkedAt, uid?
+
+chats (RTDB):           chats/{userId} -> { messages[], updatedAt }
+prompts (RTDB):         prompts/{command} -> { systemPrompt, userTemplate }
 ```
 
 ---
@@ -135,28 +142,34 @@ chats (RTDB):  chats/{userId} -> { messages[], updatedAt }
 
 | Function | Type | Purpose |
 |----------|------|---------|
-| `generateWeeklyPlan` | Callable | Rule-based scheduler: fetches events/goals/mainGoals, slots goals into free time |
-| `chatWithLLM` | Callable | AI chat with tool calling (createMainGoal, createWeeklyGoal, generateSchedule) |
-| `telegramWebhook` | HTTP | Telegram bot webhook: /start, /link, /week, /plan commands |
-| `helloWorld` | HTTP | Test/health-check endpoint |
+| `testConnection` | Callable | Smoke test for emulator CORS — returns `{ ok: true, timestamp }` |
+| `chatWithLLM` | Callable | AI chat with tool calling (12 tools: CRUD for goals, targets, events + list operations) |
+| `telegramWebhook` | HTTP | Telegram bot webhook: /start, /link, /plan, /tplan, /goals, /targets, /events, /week, /today, /archive commands |
 
 ### LLM Integration
 - **Provider**: OpenCode Zen API (`https://opencode.ai/zen/v1/chat/completions`)
 - **Model**: `big-pickle`
 - **Auth**: Bearer token via `LLM_API_KEY` environment variable
-- **Tool Calling**: 3 tools defined (createMainGoal, createWeeklyGoal, generateSchedule)
-- **Two-phase execution**: LLM returns tool calls → executed in Firestore → results sent back to LLM for natural language summary
+- **Tool Calling**: 12 tools defined (CRUD for goals, targets, events + list operations)
+- **XML Fallback**: If the model returns tool calls in XML format (`<tool_call>`), they are parsed via `parseXmlToolCalls()` as a fallback
+- **Multi-round execution**: LLM returns tool calls → executed in Firestore → results sent back to LLM (up to 5 rounds). Tool outputs (with IDs) are prepended to the final reply for conversation history context.
+- **Context commands**: `/goals`, `/events`, `/targets` in chat inject user data as context via `buildContextPrompt()`
 
 ---
 
 ## Firestore Security Rules
 
-All four main collections (`events`, `goals`, `plans`, `mainGoals`) use userId-scoped access:
-- **Read/Update/Delete**: `isOwner(resource.data.userId)` — document's userId must match `request.auth.uid`
-- **Create**: `request.auth.uid == request.resource.data.userId` — user can only create documents with their own userId
+Per-user subcollections (`users/{userId}/events`, `users/{userId}/targets`, `users/{userId}/goals`):
+- **Read/Create/Update/Delete**: User can only access their own subcollection (`request.auth.uid == userId`)
 - Unauthenticated requests are rejected
 
-RTDB rules restrict chat access to the owner: `auth.uid === $userId` at `chats/$userId`.
+Archives (`archives/{docId}`) — top-level, userId-scoped:
+- **Read/Update/Delete**: `request.auth.uid == resource.data.userId`
+- **Create**: `request.auth.uid == request.resource.data.userId`
+
+RTDB rules:
+- `chats/$userId` — owner-scoped read/write: `auth.uid === $userId`
+- `prompts/` — public read (for Cloud Functions to fetch templates)
 
 ---
 
@@ -178,19 +191,21 @@ schedule_AI/
 │       ├── Auth.tsx                # Login page (Google + email/password)
 │       ├── Dashboard.tsx           # Main layout — orchestrates all child components
 │       ├── WeekPicker.tsx          # Week navigation (prev/next/today)
-│       ├── EventList.tsx           # Calendar events CRUD
-│       ├── GoalList.tsx            # Weekly goals CRUD + main goal linking
-│       ├── MainGoalList.tsx        # Long-term goals CRUD + inline editing
-│       ├── WeeklyPlan.tsx          # AI plan generation + display + accept
-│       └── ChatPanel.tsx           # AI chat interface with RTDB persistence
+│       ├── EventList.tsx           # Calendar events CRUD (Modal-based forms)
+│       ├── TargetList.tsx          # Weekly targets CRUD + main goal linking (Modal-based forms)
+│       ├── MainGoalList.tsx        # Long-term goals CRUD + horizontal card layout (Modal-based forms)
+│       ├── ChatPanel.tsx           # AI chat interface with RTDB persistence + test button
+│       └── Modal.tsx               # Reusable dialog component (Escape/click-outside to close)
 ├── functions/                      # Backend (Firebase Cloud Functions, Node.js 24)
-│   ├── index.js                    # ALL cloud functions (single file, ~690 lines)
+│   ├── index.js                    # ALL cloud functions (single file, ~1334 lines)
 │   ├── package.json                # Backend deps (firebase-admin, firebase-functions)
 │   ├── .env                        # Local secrets (gitignored)
 │   ├── .env.example                # Secrets template
 │   └── .eslintrc.js                # ESLint config (Google style)
+├── scripts/                        # Dev utility scripts
+│   ├── prepare-emulators.mjs       # Renames firebase-export → emulator-data before start
+│   └── auto-export.mjs             # Periodic emulator backup (10 min interval)
 ├── dist/                           # Vite production build output
-├── .tasks/complete/                # Completed task records (11 tasks)
 ├── firestore.rules                 # Firestore security rules
 ├── firestore.indexes.json          # Composite indexes
 ├── database.rules.json             # RTDB security rules
@@ -228,17 +243,21 @@ App (auth gate)
 │   └── Email/password form
 └── Dashboard                     # Authenticated view (receives User)
     ├── Header (title, user, sign-out)
-    └── <main>
-        ├── MainGoalList          ──> Firestore "mainGoals" (full CRUD)
-        ├── WeekPicker            ──> Local state: weekRange
-        ├── EventList             ──> Firestore "events" (create + delete)
-        ├── GoalList              ──> Firestore "goals" (create + delete)
-        │                          ──> Firestore "mainGoals" (read for dropdown)
-        ├── WeeklyPlan            ──> Cloud Function "generateWeeklyPlan"
-        │                          ──> Firestore "plans" (save generated plan)
-        │                          ──> Firestore "events" (on accept: convert slots → events)
-        └── ChatPanel             ──> Cloud Function "chatWithLLM"
-                                   ──> RTDB "chats/{userId}" (load + persist)
+    ├── <main>
+    │   ├── MainGoalList          ──> Firestore "users/{uid}/goals" (full CRUD via Modal forms)
+    │   ├── WeekPicker            ──> Local state: weekRange
+    │   ├── EventList             ──> Firestore "users/{uid}/events" (CRUD via Modal forms)
+    │   └── TargetList            ──> Firestore "users/{uid}/targets" (CRUD via Modal forms)
+    │                              ──> Firestore "users/{uid}/goals" (read for dropdown)
+    ├── Chat toggle button        # Fixed bottom-center, toggles chatbox
+    └── ChatPanel (floating)      ──> Cloud Function "chatWithLLM"
+       (Test Connection btn)         ──> Cloud Function "testConnection"
+                                      ──> RTDB "chats/{userId}" (load + persist)
+                                      ──> onToolAction callback (refreshes goals/targets/events after AI tool calls)
+
+Shared components:
+└── Modal                         # Reusable dialog (Escape to close, click-outside to close)
+                                  # Used by: EventList, TargetList, MainGoalList for add/edit/delete forms
 ```
 
 **State management**: No global state library. All state is local `useState` in each component. Data is fetched from Firestore via one-time `getDocs` queries (not real-time listeners). Props flow from `Dashboard` down: `userId` and `weekOf` are passed to all children.
@@ -247,50 +266,48 @@ App (auth gate)
 
 ### Firestore Data Model
 
+All user data lives in per-user subcollections under `users/{uid}/`. This ensures each user can only access their own data via security rules.
+
 ```
-events/
-  {docId}
-    userId: string           # Owner's Firebase UID
+users/{uid}/
+  events/{docId}
     title: string            # e.g. "Team meeting"
     date: string             # ISO date "2026-07-08"
     startTime: string        # "HH:MM" e.g. "09:00"
     endTime: string          # "HH:MM" e.g. "10:00"
     createdAt: Timestamp
 
-goals/
-  {docId}
-    userId: string
-    text: string             # Goal description
+  targets/{docId}
+    text: string             # Target description
     priority: number         # 1-5 (5 = highest)
     estimatedHours: number   # e.g. 2, 0.5
-    weekOf: string           # ISO Monday date "2026-07-06"
+    status: "current" | "upcoming" | "recurring"
     deadline?: string        # Optional ISO date
-    mainGoalId?: string      # Optional link to mainGoals/{docId}
+    mainGoalId?: string      # Optional link to goals/{docId}
     createdAt: Timestamp
 
-mainGoals/
-  {docId}
-    userId: string
+  goals/{docId}
     title: string
     description?: string
     targetDate?: string      # ISO date "2026-12-31"
     status: "not_started" | "in_progress" | "done"
     createdAt: Timestamp
 
-plans/
-  {docId}
+archives/{docId}              # Top-level, userId-scoped via security rules
     userId: string
-    weekOf: string           # ISO Monday date
-    generatedAt: Timestamp
-    accepted: boolean        # Whether plan was accepted (converted to events)
-    slots: PlanSlot[]        # Array of scheduled time blocks
+    type: "target" | "event" | "goal"
+    name: string
+    weekStart: number         # Unix timestamp (ms)
+    weekEnd: number           # Unix timestamp (ms)
+    goalId?: string           # Linked goal ID (for archived targets)
+    goalTitle?: string        # Linked goal title (for archived targets)
+    archivedAt: Timestamp
 
-telegramUsers/
-  {telegramFromId}           # Telegram user ID as document ID
-    email: string            # Linked Firebase email
-    chatId: number           # Telegram chat ID for sending messages
+telegramUsers/{telegramFromId}  # Telegram user ID as document ID
+    email: string              # Linked Firebase email
+    chatId: number             # Telegram chat ID for sending messages
     linkedAt: Timestamp
-    uid?: string             # Firebase UID (not yet populated — see known issues)
+    uid?: string               # Firebase UID (not yet populated — see known issues)
 ```
 
 **RTDB structure** (separate from Firestore):
@@ -299,6 +316,11 @@ chats/
   {userId}
     messages: Array<{role: string, content: string}>
     updatedAt: number        # Unix timestamp
+
+prompts/
+  {command}                  # e.g. "plan", "tplan"
+    systemPrompt: string     # System message for the LLM
+    userTemplate: string     # User message template with {{placeholders}}
 ```
 
 ### TypeScript Interfaces (`src/types.ts`)
@@ -307,74 +329,87 @@ chats/
 interface CalendarEvent { id?, userId, title, date, startTime, endTime, createdAt? }
 type MainGoalStatus = "not_started" | "in_progress" | "done"
 interface MainGoal { id?, userId, title, description?, targetDate?, status, createdAt? }
-interface Goal { id?, userId, text, priority, estimatedHours, weekOf, deadline?, mainGoalId?, createdAt? }
-interface PlanSlot { day, date, startTime, endTime, goalId, goalText }
-interface WeeklyPlan { id?, userId, weekOf, generatedAt?, accepted, slots: PlanSlot[] }
+interface Target { id?, userId, text, priority, estimatedHours, status, deadline?, mainGoalId?, createdAt? }
 interface WeekRange { start: Date, end: Date, label: string }
 ```
 
 ### Cloud Functions Architecture (`functions/index.js`)
 
-All functions are defined in a single file. Key patterns:
+All functions are defined in a single file (~1125 lines). Key patterns:
 
-#### `generateWeeklyPlan` (Callable, lines 162-178)
+#### `testConnection` (Callable)
 ```
-Client calls with { weekOf }
-  → buildPlan(uid, weekOf)
-    → Query Firestore: events (by userId + date range)
-    → Query Firestore: goals (by userId + weekOf)
-    → Query Firestore: mainGoals (by userId)
-    → scheduleGoals(events, goals, weekDays, mainGoals)
-      → Sort goals by priority (highest first)
-      → For each goal, iterate Mon-Sun
-      → Compute free slots between events (09:00-18:00 window)
-      → Assign up to 3 hours per free slot
-      → Continue until estimatedHours fulfilled
-  → Return { slots: PlanSlot[] }
+Returns { ok: true, timestamp } — smoke test for emulator CORS
 ```
 
-#### `chatWithLLM` (Callable, lines 582-690)
+#### `chatWithLLM` (Callable)
 ```
 Client calls with { messages: Array<{role, content}> }
+  → Detect special commands: /plan, /tplan, /goals, /events, /targets
+      → If found: fetch prompt template from RTDB, build context prompt with user data
   → Send to OpenCode Zen API (big-pickle model) with TOOLS + tool_choice: "auto"
-  → If LLM returns tool_calls:
+  → If LLM returns tool_calls (native API format or XML fallback):
       → Execute each via handleToolCall(toolCall, uid)
-        → createMainGoal → Firestore "mainGoals" write
-        → createWeeklyGoal → Firestore "goals" write
-        → generateSchedule (rule) → buildPlan() → slots
-        → generateSchedule (llm) → return raw data for LLM
+        → Writes to users/{uid}/goals, users/{uid}/targets, users/{uid}/events
       → Send tool results back to LLM for follow-up response
-  → Return { reply: string, model: string }
+      → Multi-round: up to 5 rounds of tool execution
+  → Return { reply, model, systemMessage, steps }
 ```
 
-#### `telegramWebhook` (HTTP, lines 354-568)
+#### `telegramWebhook` (HTTP)
 ```
 POST from Telegram Bot API
   → Extract chatId, text, fromId
   → Route by command:
-      /start → Welcome message
+      /start → Welcome message with all commands
       /link <email> → Store in telegramUsers collection
-      /week → Lookup user → buildPlan() → Format schedule as markdown
-      /plan <goals> → LLM with tools → create goals → generate schedule → summary
+      /today → Show today's date
+      /goals → Fetch user's goals, display current (non-done) ones
+      /targets → Fetch user's current/recurring targets
+      /events → Fetch this week's events
+      /week → Show current week date range
+      /tplan → Fetch tplan template from RTDB, fill with user data, call LLM
+      /plan → Fetch plan template from RTDB, fill with user data, call LLM
+      /archive → Archive current targets, past events, completed goals
   → Send reply via Telegram sendMessage API
   → Always return 200 (Telegram retries on non-200)
 ```
 
-#### LLM Tool Definitions (lines 182-237)
-Three OpenAI-compatible function-calling tools:
+#### LLM Tool Definitions
+Twelve OpenAI-compatible function-calling tools:
 
 | Tool | Parameters | Firestore Write |
 |------|-----------|-----------------|
-| `createMainGoal` | title, description, targetDate, status | `mainGoals` collection |
-| `createWeeklyGoal` | text, priority, estimatedHours, weekOf, mainGoalId? | `goals` collection |
-| `generateSchedule` | weekOf, method ("rule" \| "llm") | Read-only (returns slots or data) |
+| `createMainGoal` | title, description, targetDate, status | `users/{uid}/goals` collection |
+| `createTarget` | text, priority, estimatedHours, status, mainGoalId? | `users/{uid}/targets` collection |
+| `createEvent` | title, date, startTime, endTime | `users/{uid}/events` collection |
+| `updateMainGoal` | id, title?, description?, targetDate?, status? | `users/{uid}/goals` collection |
+| `updateTarget` | id, text?, priority?, estimatedHours?, status?, mainGoalId? | `users/{uid}/targets` collection |
+| `updateEvent` | id, title?, date?, startTime?, endTime? | `users/{uid}/events` collection |
+| `deleteMainGoal` | id | `users/{uid}/goals` collection |
+| `deleteTarget` | id | `users/{uid}/targets` collection |
+| `deleteEvent` | id | `users/{uid}/events` collection |
+| `listMainGoals` | (none) | read-only |
+| `listTargets` | status? | read-only |
+| `listEvents` | weekOf?, weekEnd? | read-only |
 
 #### Helper Functions
-- `getWeekDays(weekOf)` — Returns array of 7 `{day, date}` objects (Mon-Sun)
-- `scheduleGoals(events, goals, weekDays, mainGoals)` — Rule-based scheduler
-- `buildPlan(uid, weekOf)` — Fetches all user data, runs scheduler
-- `handleToolCall(toolCall, uid)` — Routes LLM tool calls to Firestore operations
+- `handleToolCall(toolCall, uid)` — Routes LLM tool calls to Firestore operations (writes to `users/{uid}/` subcollections)
+- `parseXmlToolCalls(content)` — Fallback parser for XML-formatted tool calls from big-pickle model
+- `formatToolResult(toolName, result)` — Formats tool outputs with IDs for conversation history context
 - `getCurrentWeekMonday()` — Returns ISO date string for current week's Monday
+- `getCurrentWeekSunday()` — Returns ISO date string for current week's Sunday
+- `getCurrentDate()` — Returns ISO date string for today
+- `getPromptTemplate(command)` — Fetches prompt template from RTDB `prompts/{command}`
+- `fetchUserData(uid, weekOf, targetStatus?, weekEnd?)` — Fetches user's targets, events, and goals for template placeholder filling
+- `fetchMainGoalsForUser(uid)` — Fetches all goals sorted by status and target date
+- `fetchEventsForWeek(uid, weekOf, weekEnd?)` — Fetches events bounded by week range
+- `fetchTargetsForUser(uid, targetStatus?)` — Fetches targets filtered by status, sorted by priority
+- `buildContextPrompt(uid, command, trailingText)` — Builds context prompt for /goals, /events, /targets commands
+- `fillTemplate(template, vars)` — Replaces `{{key}}` placeholders in template strings
+- `formatMainGoal(goal, index)` — Formats a goal for Telegram display
+- `formatEventLine(event, index)` — Formats an event for Telegram display
+- `formatTargetLine(target, index)` — Formats a target for Telegram display
 
 ### Firebase Integration
 
@@ -395,18 +430,21 @@ Exports helper functions: `signInWithGoogle`, `signInWithEmail`, `signOutUser`, 
 #### Backend (`functions/index.js`)
 - Initializes Firebase Admin SDK with `admin.initializeApp()`
 - Uses `admin.firestore()` for server-side Firestore access (bypasses security rules)
+- Uses `admin.database()` for server-side RTDB access (prompt templates)
 - Secrets managed via `defineString()` (Firebase Secrets Manager in production, `process.env` in emulator)
 
 ### Security Rules
 
 #### Firestore (`firestore.rules`)
 ```javascript
-function isOwner(userId) {
-  return request.auth != null && request.auth.uid == userId;
-}
+// Per-user subcollections: users/{userId}/{collection}/{document}
+// Authenticated users can only access their own subcollection
+allow read: if request.auth != null && request.auth.uid == userId;
+allow create: if request.auth != null && request.auth.uid == userId;
+allow update, delete: if request.auth != null && request.auth.uid == userId;
 
-// For events, goals, plans, mainGoals:
-allow read, update, delete: if isOwner(resource.data.userId);
+// Archives: top-level collection, userId-scoped via resource/request data
+allow read, update, delete: if request.auth != null && request.auth.uid == resource.data.userId;
 allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
 ```
 
@@ -417,6 +455,9 @@ allow create: if request.auth != null && request.auth.uid == request.resource.da
     ".read": "auth != null && auth.uid === $userId",
     ".write": "auth != null && auth.uid === $userId"
   }
+},
+"prompts": {
+  ".read": true
 }
 ```
 
@@ -427,8 +468,9 @@ allow create: if request.auth != null && request.auth.uid == request.resource.da
 | `npm run dev` | Root | Start Vite dev server |
 | `npm run build` | Root | `tsc -b && vite build` → `dist/` |
 | `npm run preview` | Root | Preview production build |
+| `npm run emulators` | Root | Start emulators with data persistence (imports `emulator-data` on start) |
+| `npm run emulators:export` | Root | Periodic emulator export to `emulator-data` (10 min interval, run alongside emulators) |
 | `npm run lint` | `functions/` | ESLint for Cloud Functions |
-| `npx firebase emulators:start` | Root | Start all Firebase emulators |
 | `firebase deploy` | Root | Deploy all (runs lint predeploy for functions) |
 
 ### Environment Variables
@@ -453,23 +495,24 @@ LLM_PROVIDER=opencode
 LLM_MODEL=big-pickle
 ```
 
+Note: Do NOT set `FIREBASE_PROJECT_ID` in `functions/.env` — the `FIREBASE_` prefix is reserved by the emulator and causes the entire `.env` file to fail to load.
+
 ### Known Issues & Technical Debt
 
 1. **No real-time listeners** — All Firestore reads use `getDocs` (one-time snapshots). Changes from other tabs/devices won't appear until the user navigates or refreshes. Consider switching to `onSnapshot` for live updates.
 
 2. **No optimistic updates** — All mutations re-fetch the entire collection after write. Could be improved with local state updates before server confirmation.
 
-3. **Telegram `/link` doesn't set `uid`** — The `/link` command stores `email` and `chatId` but never populates the `uid` field on the `telegramUsers` document. This means `/week` and `/plan` commands always return "pending verification" until uid lookup is implemented.
+3. **Telegram `/link` doesn't set `uid`** — The `/link` command stores `email` and `chatId` but never populates the `uid` field on the `telegramUsers` document. This means `/plan`, `/tplan`, `/goals`, `/targets`, `/events`, and `/archive` commands return "pending verification" until uid lookup is implemented.
 
-4. **Single-file Cloud Functions** — All backend logic lives in `functions/index.js` (~690 lines). Consider splitting into separate files as the codebase grows.
+4. **Single-file Cloud Functions** — All backend logic lives in `functions/index.js` (~1334 lines). Consider splitting into separate files as the codebase grows.
 
-5. **Rule-based scheduler only** — The `scheduleGoals()` function is deterministic. LLM-powered scheduling is stubbed out with a TODO comment. The tool calling infrastructure (`generateSchedule` with `method: "llm"`) returns raw data but the LLM doesn't yet generate structured schedule output.
-
-6. **No tests** — Neither the frontend nor backend has test files or testing frameworks configured.
+5. **No tests** — Neither the frontend nor backend has test files or testing frameworks configured.
 
 ---
 
-## Future Enhancements (from code comments)
+## Future Enhancements
 
-1. **LLM-powered plan generation** — Replace rule-based scheduler with AI scheduling (tool calling infrastructure exists, scheduler has TODO comment)
-2. **Multi-user Telegram linking** — The `/link` command stores email but doesn't set `uid` on the `telegramUsers` document, so `/week` and `/plan` commands return "pending verification" until uid verification is implemented
+1. **LLM-powered plan generation in web app** — The `/plan` and `/tplan` prompt template system works in Telegram; extend it to the web ChatPanel
+2. **Multi-user Telegram linking** — The `/link` command stores email but doesn't set `uid` on the `telegramUsers` document, so `/plan`, `/tplan`, `/goals`, `/targets`, `/events`, and `/archive` return "pending verification" until uid lookup is implemented
+3. **Real-time listeners** — Switch from `getDocs` to `onSnapshot` for live updates across tabs/devices
