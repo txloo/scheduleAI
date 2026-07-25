@@ -1,7 +1,6 @@
-import { useEffect, useState, useMemo, forwardRef, useImperativeHandle } from "react";
+import { useState, useMemo, forwardRef, useImperativeHandle } from "react";
 import {
   collection,
-  getDocs,
   addDoc,
   deleteDoc,
   doc,
@@ -13,16 +12,15 @@ import Modal from "./Modal";
 
 interface EventListProps {
   userId: string;
-  weekOf: string;
-  weekEnd: string;
+  events: CalendarEvent[];
+  onRefresh: () => void;
 }
 
 export interface EventListHandle {
   refresh: () => void;
 }
 
-const EventList = forwardRef<EventListHandle, EventListProps>(({ userId, weekOf, weekEnd }, ref) => {
-  const [allEvents, setAllEvents] = useState<CalendarEvent[]>([]);
+const EventList = forwardRef<EventListHandle, EventListProps>(({ userId, events, onRefresh }, ref) => {
   const [title, setTitle] = useState("");
   const [date, setDate] = useState("");
   const [startTime, setStartTime] = useState("09:00");
@@ -30,44 +28,45 @@ const EventList = forwardRef<EventListHandle, EventListProps>(({ userId, weekOf,
   const [showForm, setShowForm] = useState(false);
   const [deleteEventId, setDeleteEventId] = useState<string | null>(null);
   const [deleteEventName, setDeleteEventName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
-  async function fetchEvents() {
-    const snap = await getDocs(collection(db, "users", userId, "events"));
-    const list: CalendarEvent[] = [];
-    snap.forEach((d) => {
-      const data = d.data() as Omit<CalendarEvent, "id">;
-      list.push({ id: d.id, ...data });
-    });
-    setAllEvents(list);
-  }
+  useImperativeHandle(ref, () => ({ refresh: onRefresh }));
 
-  useImperativeHandle(ref, () => ({ refresh: fetchEvents }));
-
-  useEffect(() => {
-    fetchEvents();
-  }, [userId]);
-
-  const events = useMemo(() => {
-    return allEvents
-      .filter((e) => e.date >= weekOf && e.date <= weekEnd)
-      .sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
-  }, [allEvents, weekOf, weekEnd]);
+  const groupedEvents = useMemo(() => {
+    const groups: { date: string; label: string; events: CalendarEvent[] }[] = [];
+    const dateMap = new Map<string, CalendarEvent[]>();
+    for (const ev of events) {
+      if (!dateMap.has(ev.date)) dateMap.set(ev.date, []);
+      dateMap.get(ev.date)!.push(ev);
+    }
+    for (const [date, evts] of dateMap) {
+      const d = new Date(date + "T00:00:00");
+      const label = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+      groups.push({ date, label, events: evts });
+    }
+    return groups;
+  }, [events]);
 
   async function addEvent() {
-    if (!title.trim() || !date) return;
-    await addDoc(collection(db, "users", userId, "events"), {
-      title: title.trim(),
-      date,
-      startTime,
-      endTime,
-      createdAt: Timestamp.now(),
-    });
-    setTitle("");
-    setDate("");
-    setStartTime("09:00");
-    setEndTime("10:00");
-    setShowForm(false);
-    fetchEvents();
+    if (!title.trim() || !date || submitting) return;
+    setSubmitting(true);
+    try {
+      await addDoc(collection(db, "users", userId, "events"), {
+        title: title.trim(),
+        date,
+        startTime,
+        endTime,
+        createdAt: Timestamp.now(),
+      });
+      setTitle("");
+      setDate("");
+      setStartTime("09:00");
+      setEndTime("10:00");
+      setShowForm(false);
+      onRefresh();
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   function confirmDelete(event: CalendarEvent) {
@@ -79,7 +78,7 @@ const EventList = forwardRef<EventListHandle, EventListProps>(({ userId, weekOf,
     if (!deleteEventId) return;
     await deleteDoc(doc(db, "users", userId, "events", deleteEventId));
     setDeleteEventId(null);
-    fetchEvents();
+    onRefresh();
   }
 
   return (
@@ -94,24 +93,36 @@ const EventList = forwardRef<EventListHandle, EventListProps>(({ userId, weekOf,
         </button>
       </div>
 
-      <div className="space-y-1 max-h-64 overflow-y-auto">
-        {events.map((ev) => (
-          <div key={ev.id} className="flex items-center justify-between text-sm py-1 border-b last:border-0">
-            <div>
-              <span className="font-medium">{ev.title}</span>
-              <span className="text-gray-500 ml-2">
-                {ev.date} {ev.startTime}–{ev.endTime}
-              </span>
+      <div className="space-y-3 max-h-[36rem] overflow-y-auto">
+        {groupedEvents.map((group) => (
+          <div key={group.date}>
+            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1.5">
+              {group.label}
+            </h3>
+            <div className="space-y-0">
+              {group.events.map((ev) => (
+                <div
+                  key={ev.id}
+                  className="group flex gap-2 py-1 border-b border-gray-50 last:border-0 relative"
+                >
+                  <span className="text-xs text-gray-400 min-w-[80px] flex-shrink-0 pt-px">
+                    {ev.startTime}–{ev.endTime}
+                  </span>
+                  <span className="text-sm text-gray-900 leading-snug">
+                    {ev.title}
+                  </span>
+                  <button
+                    onClick={() => confirmDelete(ev)}
+                    className="absolute right-0 top-1 text-red-500 hover:text-red-700 text-sm opacity-0 group-hover:opacity-100 transition-opacity px-0.5"
+                  >
+                    &times;
+                  </button>
+                </div>
+              ))}
             </div>
-            <button
-              onClick={() => confirmDelete(ev)}
-              className="text-red-500 hover:text-red-700 text-xs"
-            >
-              ✕
-            </button>
           </div>
         ))}
-        {events.length === 0 && (
+        {groupedEvents.length === 0 && (
           <p className="text-gray-400 text-sm">No events this week</p>
         )}
       </div>
@@ -150,7 +161,7 @@ const EventList = forwardRef<EventListHandle, EventListProps>(({ userId, weekOf,
           <div className="flex gap-2">
             <button
               onClick={addEvent}
-              disabled={!title.trim() || !date}
+              disabled={!title.trim() || !date || submitting}
               className="flex-1 bg-blue-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition"
             >
               Save

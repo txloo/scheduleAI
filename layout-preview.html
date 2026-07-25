@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Schedule AI - Layout Preview</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .card { @apply bg-white rounded-lg shadow-sm border p-4; }
+    .btn-primary { @apply bg-blue-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-blue-700 transition; }
+    .btn-success { @apply bg-green-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-green-700 transition; }
+    .btn-warning { @apply bg-amber-500 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-amber-600 transition; }
+    .btn-ghost { @apply text-gray-600 hover:text-gray-900 transition; }
+    .section-label { @apply text-xs font-semibold text-gray-400 uppercase tracking-wide; }
+    .event-row { @apply flex gap-2 py-1 border-b border-gray-50 last:border-0; }
+    .goal-card { @apply bg-white border border-l-4 rounded-lg shadow-sm p-3 flex flex-col overflow-hidden min-h-[140px]; }
+    @media (min-width: 768px) {
+      .goal-card { @apply min-w-[240px] max-w-[280px] h-[280px] p-4; }
+    }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+  <!-- Header -->
+  <header class="bg-white shadow-sm border-b sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+      <h1 class="text-lg font-bold">Schedule AI</h1>
+      <div class="flex items-center gap-3">
+        <button class="btn-ghost text-sm flex items-center gap-1" title="Toggle view mode">
+          <span>↓ Targets</span>
+        </button>
+        <span class="text-sm text-gray-500">user@example.com</span>
+        <button class="text-sm text-red-600 hover:text-red-800 transition">Sign out</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-6 py-6 space-y-6">
+    <!-- Section 1: Today's Events (full width) -->
+    <div class="card">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-lg">Today's Events</h2>
+        <button class="btn-warning">Archive Day</button>
+      </div>
+      <div class="space-y-0">
+        <div class="event-row">
+          <span class="text-xs text-gray-400 min-w-[100px] flex-shrink-0">09:00–10:00</span>
+          <span class="text-sm text-gray-900">Team standup</span>
+        </div>
+        <div class="event-row">
+          <span class="text-xs text-gray-400 min-w-[100px] flex-shrink-0">14:00–15:30</span>
+          <span class="text-sm text-gray-900">Design review</span>
+        </div>
+        <div class="event-row">
+          <span class="text-xs text-gray-400 min-w-[100px] flex-shrink-0">16:00–17:00</span>
+          <span class="text-sm text-gray-900">1:1 with manager</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 2: Main Goals (full width) -->
+    <div class="card">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold text-lg">Main Goals</h2>
+        <button class="btn-success">+ Add Main Goal</button>
+      </div>
+      <div class="grid grid-cols-2 gap-3 md:flex md:gap-4 md:overflow-x-auto md:pb-2">
+        <div class="goal-card border-l-red-400">
+          <span class="font-semibold text-sm md:text-base leading-tight">Ship v2.0</span>
+          <span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 text-red-800 mt-2">Not Started</span>
+          <p class="text-xs md:text-sm text-gray-500 mt-2 overflow-y-auto hidden md:block">Launch the new version with all planned features</p>
+          <p class="text-xs text-gray-400 mt-auto pt-2">Target: Aug 1, 2026</p>
+        </div>
+        <div class="goal-card border-l-amber-400">
+          <span class="font-semibold text-sm md:text-base leading-tight">Learn Rust</span>
+          <span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 mt-2">In Progress</span>
+          <p class="text-xs md:text-sm text-gray-500 mt-2 overflow-y-auto hidden md:block">Complete the Rust book and build a CLI tool</p>
+          <p class="text-xs text-gray-400 mt-auto pt-2">Target: Dec 31, 2026</p>
+        </div>
+        <div class="goal-card border-l-green-400">
+          <span class="font-semibold text-sm md:text-base leading-tight">Read 12 Books</span>
+          <span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-800 mt-2">Done</span>
+          <p class="text-xs md:text-sm text-gray-500 mt-2 overflow-y-auto hidden md:block">Read one book per month</p>
+          <p class="text-xs text-gray-400 mt-auto pt-2">Target: Dec 31, 2026</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 3: Targets + WeekPicker/Events (side-by-side) -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <!-- WeekPicker + Events Card: second on mobile, first on desktop (left) -->
+      <div class="card order-2 md:order-1">
+        <!-- WeekPicker -->
+        <div class="flex items-center justify-between mb-4">
+          <button class="btn-ghost px-2 py-1">← Prev</button>
+          <div class="flex items-center gap-3">
+            <span class="font-medium">Jul 6 – Jul 12</span>
+            <button class="text-xs text-blue-600 hover:text-blue-800">Today</button>
+          </div>
+          <button class="btn-ghost px-2 py-1">Next →</button>
+        </div>
+
+        <!-- Events -->
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold text-lg">Events</h2>
+          <button class="btn-primary text-xs">+ Add Event</button>
+        </div>
+        <div class="space-y-3">
+          <div>
+            <h3 class="section-label mb-1.5">Mon, Jul 6</h3>
+            <div class="space-y-0">
+              <div class="event-row">
+                <span class="text-xs text-gray-400 min-w-[80px]">09:00–10:00</span>
+                <span class="text-sm text-gray-900">Team standup</span>
+              </div>
+            </div>
+          </div>
+          <div>
+            <h3 class="section-label mb-1.5">Wed, Jul 8</h3>
+            <div class="space-y-0">
+              <div class="event-row">
+                <span class="text-xs text-gray-400 min-w-[80px]">14:00–15:30</span>
+                <span class="text-sm text-gray-900">Design review</span>
+              </div>
+            </div>
+          </div>
+          <div>
+            <h3 class="section-label mb-1.5">Fri, Jul 10</h3>
+            <div class="space-y-0">
+              <div class="event-row">
+                <span class="text-xs text-gray-400 min-w-[80px]">10:00–11:00</span>
+                <span class="text-sm text-gray-900">Sprint planning</span>
+              </div>
+              <div class="event-row">
+                <span class="text-xs text-gray-400 min-w-[80px]">16:00–17:00</span>
+                <span class="text-sm text-gray-900">Demo day</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Targets Card: first on mobile, second on desktop (right) -->
+      <div class="card order-1 md:order-2">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold text-lg">Targets</h2>
+          <button class="btn-primary text-xs">+ Add Target</button>
+        </div>
+        <div class="space-y-3">
+          <div class="bg-gray-50 rounded p-3">
+            <div class="flex items-start justify-between">
+              <div>
+                <p class="text-sm font-medium">Finish API integration</p>
+                <p class="text-xs text-gray-500">Priority: 5 | Est: 4h</p>
+              </div>
+              <span class="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded">Current</span>
+            </div>
+            <p class="text-xs text-gray-400 mt-1">→ Ship v2.0</p>
+          </div>
+          <div class="bg-gray-50 rounded p-3">
+            <div class="flex items-start justify-between">
+              <div>
+                <p class="text-sm font-medium">Write unit tests</p>
+                <p class="text-xs text-gray-500">Priority: 3 | Est: 2h</p>
+              </div>
+              <span class="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded">Current</span>
+            </div>
+          </div>
+          <div class="bg-gray-50 rounded p-3">
+            <div class="flex items-start justify-between">
+              <div>
+                <p class="text-sm font-medium">Review PRs</p>
+                <p class="text-xs text-gray-500">Priority: 2 | Est: 1h</p>
+              </div>
+              <span class="text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded">Recurring</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Layout Notes -->
+    <div class="bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm">
+      <h3 class="font-semibold text-amber-800 mb-2">Layout Notes</h3>
+      <ul class="list-disc list-inside text-amber-700 space-y-1">
+        <li><strong>Today's Events</strong> - Full width, read-only with archive button (first)</li>
+        <li><strong>Main Goals</strong> - Full width, horizontal scroll cards</li>
+        <li><strong>WeekPicker+Events + Targets</strong> - Side-by-side on desktop, Targets wraps above Events on mobile</li>
+        <li><strong>Mobile</strong> - Targets above, then WeekPicker+Events below</li>
+        <li><strong>Desktop</strong> - WeekPicker+Events (left) | Targets (right)</li>
+        <li><strong>View Mode Toggle</strong> - Changes order of Targets/Events on mobile</li>
+      </ul>
+      <div class="mt-3 pt-3 border-t border-amber-200">
+        <p class="font-medium text-amber-800">View Modes:</p>
+        <ul class="list-disc list-inside text-amber-700 mt-1">
+          <li><code>targets-first</code> (default) - Targets before Events</li>
+          <li><code>events-first</code> - Events before Targets</li>
+          <li><code>tabbed</code> - Tab switching between Targets/Events</li>
+        </ul>
+        <p class="text-amber-600 mt-2 text-xs">URL parameter: <code>?view=targets-first</code></p>
+      </div>
+    </div>
+  </main>
+
+  <!-- Chat Button (floating) -->
+  <button class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-blue-500 text-white rounded-full p-3 shadow-lg hover:bg-blue-600 transition">
+    <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+      <path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+    </svg>
+  </button>
+</body>
+</html>

@@ -30,7 +30,9 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
   const [editStatus, setEditStatus] = useState<MainGoalStatus>("not_started");
   const [deleteGoalId, setDeleteGoalId] = useState<string | null>(null);
   const [deleteGoalName, setDeleteGoalName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const [optimisticStatuses, setOptimisticStatuses] = useState<Record<string, MainGoalStatus>>({});
+  const optimisticStatusesRef = useRef<Record<string, MainGoalStatus>>({});
   const saveTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   const STATUS_CYCLE: Record<MainGoalStatus, MainGoalStatus> = {
@@ -46,20 +48,25 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
   }, []);
 
   async function addMainGoal() {
-    if (!title.trim()) return;
-    await addDoc(collection(db, "users", userId, "goals"), {
-      title: title.trim(),
-      description: description.trim() || null,
-      targetDate: targetDate || null,
-      status,
-      createdAt: Timestamp.now(),
-    });
-    setTitle("");
-    setDescription("");
-    setTargetDate("");
-    setStatus("not_started");
-    setShowForm(false);
-    onMainGoalsChange();
+    if (!title.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      await addDoc(collection(db, "users", userId, "goals"), {
+        title: title.trim(),
+        description: description.trim() || null,
+        targetDate: targetDate || null,
+        status,
+        createdAt: Timestamp.now(),
+      });
+      setTitle("");
+      setDescription("");
+      setTargetDate("");
+      setStatus("not_started");
+      setShowForm(false);
+      onMainGoalsChange();
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   function startEdit(goal: MainGoal) {
@@ -96,9 +103,11 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
   }
 
   function handleStatusCycle(goal: MainGoal) {
-    const nextStatus = STATUS_CYCLE[goal.status];
+    const currentStatus = optimisticStatusesRef.current[goal.id!] || goal.status;
+    const nextStatus = STATUS_CYCLE[currentStatus];
+    optimisticStatusesRef.current[goal.id!] = nextStatus;
 
-    setOptimisticStatuses((prev) => ({ ...prev, [goal.id!]: nextStatus }));
+    setOptimisticStatuses({ ...optimisticStatusesRef.current });
 
     if (saveTimers.current[goal.id!]) {
       clearTimeout(saveTimers.current[goal.id!]);
@@ -107,6 +116,7 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
     saveTimers.current[goal.id!] = setTimeout(async () => {
       await updateDoc(doc(db, "users", userId, "goals", goal.id!), { status: nextStatus });
       await onMainGoalsChange();
+      delete optimisticStatusesRef.current[goal.id!];
       setOptimisticStatuses((prev) => {
         const next = { ...prev };
         delete next[goal.id!];
@@ -132,7 +142,7 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
     });
   }
 
-  function statusBadge(status: MainGoalStatus) {
+  function statusBadge(status: MainGoalStatus, onClick?: () => void) {
     const classes: Record<MainGoalStatus, string> = {
       not_started: "bg-red-100 text-red-800",
       in_progress: "bg-amber-100 text-amber-800",
@@ -144,7 +154,10 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
       done: "Done",
     };
     return (
-      <span className={`inline-block text-xs font-medium px-2 py-0.5 rounded-full ${classes[status]}`}>
+      <span
+        onClick={onClick}
+        className={`inline-block text-xs font-medium px-2 py-0.5 rounded-full ${classes[status]}${onClick ? " cursor-pointer hover:opacity-80" : ""}`}
+      >
         {labels[status]}
       </span>
     );
@@ -165,10 +178,10 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
       <div
         key={goal.id}
         onDoubleClick={() => handleStatusCycle(goal)}
-        className={`min-w-[240px] max-w-[280px] h-[280px] shrink-0 bg-white border border-l-4 ${goalAccent(displayStatus)} rounded-lg shadow-sm p-4 flex flex-col overflow-hidden select-none`}
+        className={`bg-white border border-l-4 ${goalAccent(displayStatus)} rounded-lg shadow-sm p-3 flex flex-col overflow-hidden select-none min-h-[140px] md:min-w-[240px] md:max-w-[280px] md:h-[280px] md:p-4`}
       >
         <div className="flex items-start justify-between mb-2">
-          <span className="font-semibold text-base leading-tight">{goal.title}</span>
+          <span className="font-semibold text-sm md:text-base leading-tight">{goal.title}</span>
           <div className="flex items-center gap-0.5 ml-2 shrink-0">
             <button
               onClick={() => startEdit(goal)}
@@ -187,10 +200,10 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
           </div>
         </div>
 
-        {statusBadge(displayStatus)}
+        {statusBadge(displayStatus, () => handleStatusCycle(goal))}
 
         {goal.description && (
-          <p className="text-sm text-gray-500 mt-2 overflow-y-auto">{goal.description}</p>
+          <p className="text-xs md:text-sm text-gray-500 mt-2 overflow-y-auto hidden md:block">{goal.description}</p>
         )}
 
         {goal.targetDate && (
@@ -214,10 +227,10 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
         </button>
       </div>
 
-      <div className="flex gap-4 overflow-x-auto pb-2">
+      <div className="grid grid-cols-2 gap-3 md:flex md:gap-4 md:overflow-x-auto md:pb-2">
         {mainGoals.map((goal) => renderGoalCard(goal))}
         {mainGoals.length === 0 && (
-          <p className="text-gray-400 text-sm">
+          <p className="text-gray-400 text-sm col-span-2 md:col-span-auto">
             No main goals yet. Add a long-term goal to get started!
           </p>
         )}
@@ -258,7 +271,7 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
           <div className="flex gap-2">
             <button
               onClick={addMainGoal}
-              disabled={!title.trim()}
+              disabled={!title.trim() || submitting}
               className="flex-1 bg-green-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition"
             >
               Save

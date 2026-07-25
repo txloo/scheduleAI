@@ -50,6 +50,7 @@ const TOOLS = [
           estimatedHours: {type: "number", description: "Estimated hours needed"},
           status: {type: "string", enum: ["current", "upcoming", "recurring"], description: "Status of the target (current, upcoming, or recurring)"},
           mainGoalId: {type: "string", description: "Optional ID of an associated main goal"},
+          weekOf: {type: "string", description: "ISO Monday date of the target's week (e.g. 2026-07-28). Used for sort order within same priority. Defaults to current week."},
         },
         required: ["text", "priority", "estimatedHours"],
       },
@@ -105,6 +106,7 @@ const TOOLS = [
           estimatedHours: {type: "number", description: "New estimated hours"},
           status: {type: "string", enum: ["current", "upcoming", "recurring"], description: "New status"},
           mainGoalId: {type: "string", description: "New linked main goal ID (empty string to unlink)"},
+          weekOf: {type: "string", description: "New target week (ISO Monday date)"},
         },
         required: ["id"],
       },
@@ -222,15 +224,15 @@ const BASE_SYSTEM_PROMPT = [
   "",
   "DEFINITIONS:",
   "- Main Goals: Long-term, aspirational objectives that span weeks or months (e.g. \"Launch my startup\", \"Get fit\"). They have a title, optional description, optional target date, and status (not_started, in_progress, done). Use createMainGoal / updateMainGoal / deleteMainGoal / listMainGoals.",
-  "- Targets: Short-term, actionable tasks for the current week (e.g. \"Finish report\", \"Exercise 3x\"). They have a text description, priority 1-5, estimated hours, and status (current, upcoming, recurring). Targets can be linked to a Main Goal via mainGoalId. Use createTarget / updateTarget / deleteTarget / listTargets.",
+  "- Targets: Short-term, actionable tasks for the current week (e.g. \"Finish report\", \"Exercise 3x\"). They have a text description, priority 1-5, estimated hours, and status (current, upcoming, recurring). Targets can be linked to a Main Goal via mainGoalId. Targets have an optional weekOf field (ISO Monday date) used for sort order within the same priority — when creating targets for a future week, set weekOf to that week's Monday. Use createTarget / updateTarget / deleteTarget / listTargets.",
   "- Events: Fixed calendar appointments with a specific date and time range (e.g. \"Team meeting, July 15, 09:00-10:00\"). Use createEvent / updateEvent / deleteEvent / listEvents.",
   "",
   "TOOLS:",
   "- createMainGoal: title (required), description, targetDate (ISO), status (not_started|in_progress|done, required)",
-  "- createTarget: text (required), priority 1-5 (required), estimatedHours (required), status (current|upcoming|recurring), mainGoalId",
+  "- createTarget: text (required), priority 1-5 (required), estimatedHours (required), status (current|upcoming|recurring), mainGoalId, weekOf (ISO Monday date for sort order)",
   "- createEvent: title (required), date ISO (required), startTime HH:MM (required), endTime HH:MM (required)",
   "- updateMainGoal: id (required), title, description, targetDate, status (not_started|in_progress|done)",
-  "- updateTarget: id (required), text, priority, estimatedHours, status (current|upcoming|recurring), mainGoalId",
+  "- updateTarget: id (required), text, priority, estimatedHours, status (current|upcoming|recurring), mainGoalId, weekOf",
   "- updateEvent: id (required), title, date, startTime, endTime",
   "- deleteMainGoal: id (required)",
   "- deleteTarget: id (required)",
@@ -240,10 +242,10 @@ const BASE_SYSTEM_PROMPT = [
   "- listEvents: weekOf (ISO Monday date, optional), weekEnd (ISO Sunday date, optional)",
   "",
   "RULES:",
+  "- When the current message includes data injected from /goals, /events, /targets, /plan, or /tplan, use that data directly — it is the user's actual data expanded inline. Do not ask the user to retype it.",
   "- For read requests (list, see, get, show): Call the appropriate tool immediately, then summarize results.",
   "- For write requests (create, update, delete): First gather ALL required details from the user through conversation. Present a summary and ask for confirmation. Only call the tool AFTER the user confirms. Never assume values for required fields.",
   "- For bulk operations (delete all, update all, rename many, etc.): First call the relevant list tool to collect every matching ID, then ask for confirmation. After confirmation, include ALL write tool calls in a single response as an array — do not execute them one at a time.",
-  "- When the current message includes context injected from /goals, /events, or /targets, use that context directly and do not ask the user to retype it.",
   "- Never fabricate, guess, or hallucinate data.",
   "- When a tool returns a result, base your response ONLY on what the tool explicitly returned. Do not assume, extrapolate, or infer data that the tool did not provide. If a tool says 'not found', say exactly that — do not claim other data doesn't exist.",
   "- When executing multiple write operations at once, include ALL tool calls in a single response array. The system supports parallel tool execution.",
@@ -256,11 +258,12 @@ function formatMainGoal(goal, index) {
 }
 
 function formatEventLine(event, index) {
-  return `${index + 1}. ${event.title} (${event.date} ${event.startTime}-${event.endTime})`;
+  return `${index + 1}. ${event.title} (${event.date} ${event.startTime}-${event.endTime}) [id: ${event.id}]`;
 }
 
 function formatTargetLine(target, index) {
-  return `${index + 1}. ${target.text} [Priority ${target.priority}, ${target.estimatedHours}h, ${target.status || "current"}]`;
+  const weekOf = target.weekOf ? ` Week of ${target.weekOf}` : "";
+  return `${index + 1}. ${target.text} [Priority ${target.priority}, ${target.estimatedHours}h, ${target.status || "current"}${weekOf}] [id: ${target.id}]`;
 }
 
 function formatToolResult(toolName, result) {
@@ -271,7 +274,10 @@ function formatToolResult(toolName, result) {
   }
   if (toolName === "listTargets") {
     if (!result.items || result.items.length === 0) return "Targets:\nNone";
-    const lines = result.items.map((item, i) => `${i + 1}. ${item.text} [Priority ${item.priority}, ${item.estimatedHours}h, ${item.status || "current"}] [id: ${item.id}]`);
+    const lines = result.items.map((item, i) => {
+      const weekOf = item.weekOf ? ` Week of ${item.weekOf}` : "";
+      return `${i + 1}. ${item.text} [Priority ${item.priority}, ${item.estimatedHours}h, ${item.status || "current"}${weekOf}] [id: ${item.id}]`;
+    });
     return `Targets:\n${lines.join("\n")}`;
   }
   if (toolName === "listEvents") {
@@ -351,89 +357,434 @@ async function fetchTargetsForUser(uid, targetStatus) {
   return targets;
 }
 
-async function buildContextPrompt(uid, command, trailingText) {
-  const weekOf = getCurrentWeekMonday();
-  const today = getCurrentDate();
+// ── Shared: expand commands inline in a user message ──
 
-  if (command === "goals") {
-    const goals = await fetchMainGoalsForUser(uid);
-    const currentGoals = goals.filter((goal) => goal.status !== "done");
-    const goalsText = currentGoals.length
-      ? currentGoals.map((goal, index) => formatMainGoal(goal, index)).join("\n")
-      : "No current goals set.";
-    return {
-      systemMessage: BASE_SYSTEM_PROMPT,
-      userMessage: `${goalsText}\n\nUser request: ${trailingText || "Please help me with these current goals."}`.trim(),
-    };
+async function expandCommands(uid, text) {
+  let result = text;
+
+  // Handle /archive as an action (not expansion)
+  if (/^\/archive$/i.test(result.trim())) {
+    return {type: "action", action: "archive"};
   }
 
-  if (command === "events") {
+  // Expand /tplan before /plan to avoid partial match
+  if (/\/tplan\b/i.test(result)) {
+    const template = await getPromptTemplate("tplan");
+    if (template) {
+      const weekOf = getCurrentWeekMonday();
+      const weekEnd = getCurrentWeekSunday();
+      const today = getCurrentDate();
+      const userData = await fetchUserData(uid, weekOf, undefined, weekEnd);
+      const filled = fillTemplate(template.userTemplate, {
+        targets: userData.targets.length ? userData.targets.join("\n") : "No targets set.",
+        events: userData.events.length ? userData.events.join("\n") : "No events scheduled.",
+        mainGoals: userData.mainGoals.length ? userData.mainGoals.join("\n") : "No main goals set.",
+        weekOf,
+        today,
+      });
+      const expansion = template.systemPrompt + "\n\n" + filled;
+      result = result.replace(/\/tplan\b/gi, expansion);
+    } else {
+      result = result.replace(/\/tplan\b/gi, "(The /tplan command isn't configured yet. Ask the admin to set up prompts/tplan in the database.)");
+    }
+  }
+
+  // Expand /plan
+  if (/\/plan\b/i.test(result)) {
+    const template = await getPromptTemplate("plan");
+    if (template) {
+      const weekOf = getCurrentWeekMonday();
+      const weekEnd = getCurrentWeekSunday();
+      const today = getCurrentDate();
+      const userData = await fetchUserData(uid, weekOf, ["current", "recurring"], weekEnd);
+      const filled = fillTemplate(template.userTemplate, {
+        targets: userData.targets.length ? userData.targets.join("\n") : "No current targets set.",
+        events: userData.events.length ? userData.events.join("\n") : "No events scheduled.",
+        weekOf,
+        today,
+      });
+      const expansion = template.systemPrompt + "\n\n" + filled;
+      result = result.replace(/\/plan\b/gi, expansion);
+    } else {
+      result = result.replace(/\/plan\b/gi, "(The /plan command isn't configured yet. Ask the admin to set up prompts/plan in the database.)");
+    }
+  }
+
+  // Expand /goals
+  if (/\/goals\b/i.test(result)) {
+    const goals = await fetchMainGoalsForUser(uid);
+    const currentGoals = goals.filter((g) => g.status !== "done");
+    const goalsText = currentGoals.length
+      ? currentGoals.map((g, i) => formatMainGoal(g, i)).join("\n")
+      : "No current goals set.";
+    result = result.replace(/\/goals\b/gi, `(MAIN GOALS:\n${goalsText})`);
+  }
+
+  // Expand /events
+  if (/\/events\b/i.test(result)) {
     const events = await fetchEventsFromToday(uid);
     const eventsText = events.length
-      ? events.map((event, index) => formatEventLine(event, index)).join("\n")
+      ? events.map((e, i) => formatEventLine(e, i)).join("\n")
       : "No upcoming events.";
-    return {
-      systemMessage: BASE_SYSTEM_PROMPT,
-      userMessage: `${eventsText}\n\nUser request: ${trailingText || "Please help me with these events."}`.trim(),
-    };
+    result = result.replace(/\/events\b/gi, `(EVENTS:\n${eventsText})`);
   }
 
-  if (command === "targets") {
+  // Expand /targets
+  if (/\/targets\b/i.test(result)) {
     const targets = await fetchTargetsForUser(uid, ["current", "recurring"]);
     const targetsText = targets.length
-      ? targets.map((target, index) => formatTargetLine(target, index)).join("\n")
+      ? targets.map((t, i) => formatTargetLine(t, i)).join("\n")
       : "No current targets set.";
-    return {
-      systemMessage: BASE_SYSTEM_PROMPT,
-      userMessage: `${targetsText}\n\nUser request: ${trailingText || "Please help me with these current targets."}`.trim(),
-    };
+    result = result.replace(/\/targets\b/gi, `(TARGETS:\n${targetsText})`);
   }
 
-  if (command === "tplan") {
-    const template = await getPromptTemplate("tplan");
-    if (!template) {
-      return {systemMessage: BASE_SYSTEM_PROMPT, userMessage: "The /tplan command isn't configured yet. Ask the admin to set up prompts/tplan in the database."};
+  // Expand /week
+  if (/\/week\b/i.test(result)) {
+    const monday = getCurrentWeekMonday();
+    const sunday = getCurrentWeekSunday();
+    const mondayDate = new Date(monday + "T00:00:00");
+    const sundayDate = new Date(sunday + "T00:00:00");
+    const opts = {month: "short", day: "numeric"};
+    const label = `${mondayDate.toLocaleDateString("en-US", opts)} – ${sundayDate.toLocaleDateString("en-US", opts)}, ${sundayDate.getFullYear()}`;
+    const events = await fetchEventsForWeek(uid, monday, sunday);
+    const targets = await fetchTargetsForUser(uid);
+    const goals = (await fetchMainGoalsForUser(uid)).filter((g) => g.status !== "done");
+
+    const sections = [];
+    sections.push(`WEEK OVERVIEW: ${label}`);
+    if (events.length) {
+      sections.push(`\nEVENTS:\n${events.map((e, i) => formatEventLine(e, i)).join("\n")}`);
     }
-    const weekEnd = getCurrentWeekSunday();
-    const {events, targets, mainGoals} = await fetchUserData(uid, weekOf, undefined, weekEnd);
-    const filledTemplate = fillTemplate(template.userTemplate, {
-      targets: targets.length ? targets.join("\n") : "No targets set.",
-      events: events.length ? events.join("\n") : "No events scheduled.",
-      mainGoals: mainGoals.length ? mainGoals.join("\n") : "No main goals set.",
-      weekOf,
-      today,
-    });
-    const context = template.systemPrompt + "\n\n" + filledTemplate;
-    return {
-      systemMessage: BASE_SYSTEM_PROMPT,
-      userMessage: `${context}\n\nUser request: ${trailingText || "Please help me plan new targets for this week."}`.trim(),
-    };
+    if (targets.length) {
+      sections.push(`\nTARGETS:\n${targets.map((t, i) => formatTargetLine(t, i)).join("\n")}`);
+    }
+    if (goals.length) {
+      sections.push(`\nMAIN GOALS:\n${goals.map((g, i) => formatMainGoal(g, i)).join("\n")}`);
+    }
+    result = result.replace(/\/week\b/gi, `(${sections.join("\n")})`);
   }
 
-  if (command === "plan") {
-    const template = await getPromptTemplate("plan");
-    if (!template) {
-      return {systemMessage: BASE_SYSTEM_PROMPT, userMessage: "The /plan command isn't configured yet. Ask the admin to set up prompts/plan in the database."};
-    }
-    const weekEnd = getCurrentWeekSunday();
-    const {events, targets} = await fetchUserData(uid, weekOf, ["current", "recurring"], weekEnd);
-    const filledTemplate = fillTemplate(template.userTemplate, {
-      targets: targets.length ? targets.join("\n") : "No current targets set.",
-      events: events.length ? events.join("\n") : "No events scheduled.",
-      weekOf,
-      today,
+  return {type: "message", text: result};
+}
+
+// ── Shared: handle /archive action ──
+
+async function handleArchive(uid) {
+  const today = getCurrentDate();
+  const weekOf = getCurrentWeekMonday();
+  const weekEnd = getCurrentWeekSunday();
+  const weekStartMs = new Date(weekOf + "T00:00:00").getTime();
+  const weekEndMs = new Date(weekEnd + "T00:00:00").getTime();
+  let targetsArchived = 0;
+  let eventsArchived = 0;
+  let goalsArchived = 0;
+
+  const targetsSnap = await db.collection("users").doc(uid).collection("targets")
+      .where("status", "==", "current").get();
+  const goalsSnap = await db.collection("users").doc(uid).collection("goals").get();
+  const goalsMap = {};
+  goalsSnap.forEach((doc) => { goalsMap[doc.id] = doc.data(); });
+
+  for (const tDoc of targetsSnap.docs) {
+    const t = tDoc.data();
+    const goal = t.mainGoalId ? goalsMap[t.mainGoalId] : null;
+    await db.collection("archives").add({
+      userId: uid,
+      type: "target",
+      name: t.text,
+      weekStart: weekStartMs,
+      weekEnd: weekEndMs,
+      goalId: t.mainGoalId || null,
+      goalTitle: goal ? goal.title : null,
+      archivedAt: FieldValue.serverTimestamp(),
     });
-    const context = template.systemPrompt + "\n\n" + filledTemplate;
-    return {
-      systemMessage: BASE_SYSTEM_PROMPT,
-      userMessage: `${context}\n\nUser request: ${trailingText || "Please help me create a day-by-day schedule."}`.trim(),
-    };
+    await tDoc.ref.delete();
+    targetsArchived++;
+  }
+
+  const eventsSnap = await db.collection("users").doc(uid).collection("events")
+      .where("date", "<=", today).get();
+  for (const eDoc of eventsSnap.docs) {
+    const e = eDoc.data();
+    await db.collection("archives").add({
+      userId: uid,
+      type: "event",
+      name: e.title,
+      weekStart: new Date(e.date + "T00:00:00").getTime(),
+      weekEnd: new Date(e.date + "T00:00:00").getTime(),
+      archivedAt: FieldValue.serverTimestamp(),
+    });
+    await eDoc.ref.delete();
+    eventsArchived++;
+  }
+
+  const doneGoalsSnap = await db.collection("users").doc(uid).collection("goals")
+      .where("status", "==", "done").get();
+  for (const gDoc of doneGoalsSnap.docs) {
+    await db.collection("archives").add({
+      userId: uid,
+      type: "goal",
+      name: gDoc.data().title,
+      weekStart: weekStartMs,
+      weekEnd: weekEndMs,
+      archivedAt: FieldValue.serverTimestamp(),
+    });
+    await gDoc.ref.delete();
+    goalsArchived++;
   }
 
   return {
-    systemMessage: BASE_SYSTEM_PROMPT,
-    userMessage: trailingText || `Please help me with my schedule for ${weekOf} (${today}).`,
+    reply: `📦 Archived: ${targetsArchived} target(s), ${eventsArchived} event(s), ${goalsArchived} goal(s)`,
+    model: "archive",
+    systemMessage: null,
+    steps: [{tool: "ArchiveTargets"}, {tool: "ArchiveEvents"}, {tool: "ArchiveMainGoals"}],
   };
+}
+
+// ── Shared: call LLM with tool-calling loop (up to 5 rounds) ──
+
+async function callLLMWithTools(uid, messages, apiKey) {
+  const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "big-pickle",
+      messages,
+      tools: TOOLS,
+      tool_choice: "auto",
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    logger.error(`OpenCode Zen API error: ${response.status} ${errorText}`);
+    return {
+      reply: `Sorry, the AI service returned an error (${response.status}). Please try again later.`,
+      model: "opencode/big-pickle",
+      systemMessage: null,
+    };
+  }
+
+  const data = await response.json();
+  const choice = data.choices?.[0]?.message;
+
+  logger.info(`LLM response: tool_calls=${JSON.stringify(choice?.tool_calls?.length || 0)}, content_length=${(choice?.content || "").length}, finish_reason=${data.choices?.[0]?.finish_reason}`);
+
+  // Resolve tool calls: prefer native API format, fall back to XML parsing
+  let toolCalls = choice?.tool_calls && choice.tool_calls.length > 0
+    ? choice.tool_calls
+    : parseXmlToolCalls(choice?.content || "");
+
+  // Check if the LLM wants to call tools
+  if (toolCalls.length > 0) {
+    logger.info(`Executing ${toolCalls.length} tool call(s):`, toolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
+
+    // Execute all tool calls
+    const toolResults = [];
+    const steps = [];
+    const toolOutputs = [];
+    for (const toolCall of toolCalls) {
+      const result = await handleToolCall(toolCall, uid);
+      toolResults.push(result);
+      steps.push({tool: `${toolCall.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+      const output = formatToolResult(toolCall.function.name, result.result);
+      if (output) toolOutputs.push(output);
+    }
+
+    // Strip XML tool call blocks from content before follow-up
+    let cleanContent = choice?.content || "";
+    if (choice?.tool_calls === undefined || (choice?.tool_calls && choice.tool_calls.length === 0)) {
+      cleanContent = cleanContent.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
+    }
+
+    // Build assistant message with proper tool_calls format
+    const assistantMsg = choice?.tool_calls && choice.tool_calls.length > 0
+      ? {role: "assistant", content: choice.content || null, tool_calls: choice.tool_calls}
+      : {role: "assistant", content: cleanContent || "Let me check that for you."};
+
+    // Initial conversation for follow-up rounds
+    let conversationMessages = [
+      ...messages,
+      assistantMsg,
+      ...toolResults.map((tr) => ({
+        role: "tool",
+        tool_call_id: tr.toolCallId,
+        content: JSON.stringify(tr.result),
+      })),
+    ];
+
+    // Multi-step tool loop: up to 5 rounds of tool execution
+    let finalReply = null;
+    for (let round = 0; round < 5; round++) {
+      const body = {model: "big-pickle", messages: conversationMessages, tools: TOOLS};
+
+      const followUpResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!followUpResponse.ok) {
+        const errorText = await followUpResponse.text();
+        logger.error(`OpenCode Zen API follow-up error: ${followUpResponse.status} ${errorText}`);
+        const summaries = steps.map((s) => s.tool).join("\n");
+        const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
+        return {reply: `${listPrefix}I've completed the following actions:\n${summaries}`, steps, model: "opencode/big-pickle", systemMessage: null};
+      }
+
+      const data = await followUpResponse.json();
+      const msg = data.choices?.[0]?.message;
+      const nextToolCalls = msg?.tool_calls && msg.tool_calls.length > 0
+        ? msg.tool_calls
+        : parseXmlToolCalls(msg?.content || "");
+
+      // No more tool calls — return text response
+      if (nextToolCalls.length === 0) {
+        finalReply = msg?.content || "Actions completed.";
+        break;
+      }
+
+      // Execute next round of tool calls
+      logger.info(`Round ${round + 2}: executing ${nextToolCalls.length} tool call(s):`, nextToolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
+
+      const nextAssistantMsg = msg?.tool_calls && msg.tool_calls.length > 0
+        ? {role: "assistant", content: msg.content || null, tool_calls: msg.tool_calls}
+        : {role: "assistant", content: msg?.content || ""};
+
+      conversationMessages = [
+        ...conversationMessages,
+        nextAssistantMsg,
+      ];
+
+      for (const tc of nextToolCalls) {
+        const result = await handleToolCall(tc, uid);
+        steps.push({tool: `${tc.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+        const output = formatToolResult(tc.function.name, result.result);
+        if (output) toolOutputs.push(output);
+        conversationMessages.push({
+          role: "tool",
+          tool_call_id: result.toolCallId,
+          content: JSON.stringify(result.result),
+        });
+      }
+    }
+
+    // Force a summary response if the loop ended without a text reply
+    if (!finalReply) {
+      conversationMessages.push({role: "user", content: "Summarize what you just did for the user in a natural, friendly way."});
+      const summaryResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({model: "big-pickle", messages: conversationMessages}),
+      });
+      if (summaryResponse.ok) {
+        const summaryData = await summaryResponse.json();
+        finalReply = summaryData.choices?.[0]?.message?.content || "Actions completed.";
+      } else {
+        const summaries = steps.map((s) => s.tool).join("\n");
+        finalReply = `I've completed the following actions:\n${summaries}`;
+      }
+    }
+
+    const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
+    return {reply: `${listPrefix}${finalReply || "Actions completed."}`, steps, model: "opencode/big-pickle", systemMessage: null};
+  }
+
+  // No tool calls — return the LLM's text response
+  const reply = choice?.content || "No response from AI.";
+  return {reply, model: "opencode/big-pickle", systemMessage: null};
+}
+
+// ── Shared: welcome message + history constants ──
+
+const WELCOME_MESSAGE = {
+  role: "assistant",
+  content: "\ud83d\udc4b Hi! I'm your Schedule AI assistant. I can help you plan your week, answer questions about scheduling, or just chat. What can I help you with?",
+};
+
+// ── Shared: process a user message (core logic for both web and Telegram) ──
+
+async function processMessage(uid, text, options = {}) {
+  const {context = "web"} = options;
+  const chatPath = context === "telegram" ? `chats/telegram/${uid}` : `chats/${uid}`;
+  const chatRef = rtdb.ref(chatPath);
+
+  try {
+    // Fetch existing history from RTDB
+    const chatSnap = await chatRef.once("value");
+    const chatData = chatSnap.val();
+    let messages = (chatData?.messages && Array.isArray(chatData.messages) && chatData.messages.length > 0)
+      ? chatData.messages
+      : [WELCOME_MESSAGE];
+
+    // Handle /clear command
+    if (/^\/clear$/i.test(text.trim())) {
+      await chatRef.set({messages: [WELCOME_MESSAGE], updatedAt: Date.now()});
+      return {reply: "Chat history cleared.", model: "opencode/big-pickle", systemMessage: null, messages: [WELCOME_MESSAGE]};
+    }
+
+    // Expand commands inline
+    const expanded = await expandCommands(uid, text);
+
+    // Handle /archive action
+    if (expanded.type === "action" && expanded.action === "archive") {
+      logger.info(`[processMessage] ${context}: /archive by ${uid}`);
+      const archiveResult = await handleArchive(uid);
+      return {...archiveResult, messages};
+    }
+
+    // Send expanded message to LLM with tools
+    const apiKey = process.env.LLM_API_KEY;
+    if (!apiKey) {
+      logger.error("LLM_API_KEY not configured");
+      return {reply: "LLM is not configured.", model: "opencode/big-pickle", systemMessage: null, messages};
+    }
+
+    logger.info(`[processMessage] ${context}: user ${uid}, message length ${expanded.text.length}`);
+
+    // Build conversation from history + expanded message
+    const historyMessages = messages.filter((m) =>
+      m.role !== "system" && m.content !== WELCOME_MESSAGE.content
+    );
+    const userMsg = {role: "user", content: expanded.text};
+    const fullMessages = [
+      {role: "system", content: BASE_SYSTEM_PROMPT},
+      ...historyMessages,
+      userMsg,
+    ];
+
+    const result = await callLLMWithTools(uid, fullMessages, apiKey);
+
+    // Build updated history: append user + assistant messages
+    const updatedHistory = [...historyMessages, userMsg, {role: "assistant", content: result.reply}];
+
+    // Sliding window: keep welcome message + last 30 entries
+    const finalMessages = updatedHistory.length > 30
+      ? [WELCOME_MESSAGE, ...updatedHistory.slice(-30)]
+      : [WELCOME_MESSAGE, ...updatedHistory];
+
+    // Persist to RTDB
+    await chatRef.set({messages: finalMessages, updatedAt: Date.now()});
+
+    return {...result, messages: finalMessages};
+  } catch (err) {
+    logger.error(`[processMessage] ${context} error for user ${uid}:`, err);
+    return {
+      reply: "Sorry, an error occurred. Please try again.",
+      model: "opencode/big-pickle",
+      systemMessage: null,
+      messages: [],
+    };
+  }
 }
 
 /**
@@ -470,6 +821,7 @@ async function handleToolCall(toolCall, uid) {
         priority: args.priority,
         estimatedHours: args.estimatedHours,
         status: args.status || "current",
+        weekOf: args.weekOf ? getMondayOf(args.weekOf) : null,
         createdAt: FieldValue.serverTimestamp(),
       };
       if (args.mainGoalId) targetData.mainGoalId = args.mainGoalId;
@@ -522,6 +874,7 @@ async function handleToolCall(toolCall, uid) {
       if (args.estimatedHours !== undefined) updates.estimatedHours = args.estimatedHours;
       if (args.status !== undefined) updates.status = args.status;
       if (args.mainGoalId !== undefined) updates.mainGoalId = args.mainGoalId || FieldValue.delete();
+      if (args.weekOf !== undefined) updates.weekOf = args.weekOf ? getMondayOf(args.weekOf) : null;
       await ref.update(updates);
       return {
         toolCallId: id,
@@ -685,6 +1038,17 @@ function getCurrentWeekMonday() {
   return `${y}-${m}-${dayStr}`;
 }
 
+function getMondayOf(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  d.setDate(diff);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
 // ── Helper: get the ISO date string for the current week's Sunday ──
 
 function getCurrentWeekSunday() {
@@ -780,10 +1144,43 @@ function fillTemplate(template, vars) {
 //
 // Then Telegram will POST updates to this endpoint whenever users message the bot.
 
+const TELEGRAM_MAX_LEN = 4096;
+
+async function sendTelegramMessage(chatId, text, token, parseMode) {
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= TELEGRAM_MAX_LEN) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf("\n", TELEGRAM_MAX_LEN);
+    if (splitAt <= 0) splitAt = TELEGRAM_MAX_LEN;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n/, "");
+  }
+  for (const chunk of chunks) {
+    const body = {chat_id: chatId, text: chunk};
+    if (parseMode) body.parse_mode = parseMode;
+    const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+    if (parseMode && !resp.ok) {
+      delete body.parse_mode;
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+    }
+  }
+}
+
 exports.telegramWebhook = onRequest(
     {maxInstances: 10, region: "asia-southeast1"},
     async (req, res) => {
-    // Only accept POST
       if (req.method !== "POST") {
         res.status(405).send("Method Not Allowed");
         return;
@@ -808,307 +1205,88 @@ exports.telegramWebhook = onRequest(
 
       logger.info(`Telegram message from ${fromId}: "${text}"`);
 
+      // Send "Thinking..." indicator immediately
+      await sendTelegramMessage(chatId, "\ud83e\udd14 Thinking...", token);
+
       try {
         let reply;
+
+        // ── Telegram-specific commands (not in shared core) ──
 
         if (/^\/start/.test(text)) {
           reply = "👋 Welcome to Schedule AI!\n\n" +
           "I can help you plan your week. First, link your account:\n" +
           "Send me your Firebase email to get started.\n\n" +
           "Commands:\n" +
-          "/link <email> - Link your Telegram to Firebase\n" +
-          "/today - Show today's date\n" +
-          "/goals - Show your current main goals\n" +
-          "/targets - Show your current targets\n" +
-          "/events - Show upcoming events (today onward)\n" +
-          "/week - Show current week date range and events\n" +
-          "/tplan - Generate new targets for this week\n" +
-          "/plan - Create a daily schedule from current targets";
+          "/link <email> — Link your Telegram to Firebase\n" +
+          "/today — Show today's date\n" +
+          "/week — Show current week date range\n" +
+          "/goals — Show your main goals (paste into chat)\n" +
+          "/targets — Show your targets (paste into chat)\n" +
+          "/events — Show upcoming events (paste into chat)\n" +
+          "/tplan — Generate new targets for this week\n" +
+          "/plan — Create a daily schedule\n" +
+          "/archive — Archive current targets, past events, completed goals\n" +
+          "/clear — Reset chat history";
         } else if (/^\/link\s+/i.test(text)) {
           const email = text.replace(/^\/link\s+/i, "").trim();
-          // Store mapping: telegramUsers/{fromId} -> { email, uid: null (until verified) }
-          await db.collection("telegramUsers").doc(String(fromId)).set({
-            email,
-            chatId,
-            linkedAt: FieldValue.serverTimestamp(),
-          });
-          reply = `✅ Linked to ${email}. You can now manage your schedule via Telegram!`;
-        } else if (/^\/week$/i.test(text)) {
-          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
-          if (!userDoc.exists) {
-            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          const existing = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (existing.exists && existing.data().uid && !existing.data().pending) {
+            reply = `✅ Already linked to ${existing.data().email}.`;
           } else {
-            const uid = userDoc.data().uid;
-            if (!uid) {
-              reply = "❌ Your account is pending verification. Try again later.";
-            } else {
-              const monday = getCurrentWeekMonday();
-              const sunday = getCurrentWeekSunday();
-              const today = getCurrentDate();
-              const mondayDate = new Date(monday + "T00:00:00");
-              const sundayDate = new Date(sunday + "T00:00:00");
-              const todayDate = new Date(today + "T00:00:00");
-              const options = {month: "short", day: "numeric"};
-              const label = `${mondayDate.toLocaleDateString("en-US", options)} – ${sundayDate.toLocaleDateString("en-US", options)}, ${sundayDate.getFullYear()}`;
-              const dayName = todayDate.toLocaleDateString("en-US", {weekday: "long"});
-              const weekHeader = `📅 Current week: ${label}\n📆 Today: ${dayName}, ${todayDate.toLocaleDateString("en-US", options)}`;
-              const events = await fetchEventsForWeek(uid, monday, sunday);
-              if (events.length === 0) {
-                reply = weekHeader + "\n\n🗓️ No events scheduled for this week.";
-              } else {
-                const lines = events.map((event, index) => formatEventLine(event, index));
-                reply = weekHeader + "\n\n🗓️ *This Week's Events:*\n\n" + lines.join("\n");
-              }
-            }
+            await db.collection("telegramUsers").doc(String(fromId)).set({
+              email,
+              chatId,
+              linkedAt: FieldValue.serverTimestamp(),
+              pending: true,
+            });
+            reply = `🔗 Link request sent for ${email}. Open the Schedule AI web app to approve.`;
           }
         } else if (/^\/today$/i.test(text)) {
           const today = getCurrentDate();
           const todayDate = new Date(today + "T00:00:00");
           const options = {weekday: "long", month: "short", day: "numeric", year: "numeric"};
           reply = `📆 Today: ${todayDate.toLocaleDateString("en-US", options)}`;
-        } else if (/^\/tplan(\b.*)?$/i.test(text)) {
+        } else if (/^\/week$/i.test(text)) {
           const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
-          if (!userDoc.exists) {
-            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          if (!userDoc.exists || !userDoc.data().uid) {
+            reply = "❌ Link your account first with /link <email>";
           } else {
             const uid = userDoc.data().uid;
-            if (!uid) {
-              reply = "❌ Your account is pending verification. Try again later.";
+            const monday = getCurrentWeekMonday();
+            const sunday = getCurrentWeekSunday();
+            const mondayDate = new Date(monday + "T00:00:00");
+            const sundayDate = new Date(sunday + "T00:00:00");
+            const opts = {month: "short", day: "numeric"};
+            const label = `${mondayDate.toLocaleDateString("en-US", opts)} – ${sundayDate.toLocaleDateString("en-US", opts)}, ${sundayDate.getFullYear()}`;
+            const events = await fetchEventsForWeek(uid, monday, sunday);
+            if (events.length === 0) {
+              reply = `📅 Current week: ${label}\n\n🗓️ No events scheduled for this week.`;
             } else {
-              const trailingText = text.replace(/^\/tplan\s*/i, "").trim();
-              const apiKey = process.env.LLM_API_KEY;
-              if (!apiKey) {
-                reply = "❌ LLM is not configured.";
-              } else {
-                const contextPrompt = await buildContextPrompt(uid, "tplan", trailingText);
-                const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${apiKey}`,
-                  },
-                  body: JSON.stringify({
-                    model: "big-pickle",
-                    messages: [
-                      {role: "system", content: BASE_SYSTEM_PROMPT},
-                      {role: "user", content: contextPrompt.userMessage},
-                    ],
-                    tools: TOOLS,
-                    tool_choice: "auto",
-                  }),
-                });
-                if (response.ok) {
-                  const data = await response.json();
-                  reply = data.choices?.[0]?.message?.content || "✅ Done.";
-                } else {
-                  reply = "❌ AI service unavailable.";
-                }
-              }
+              const lines = events.map((event, index) => formatEventLine(event, index));
+              reply = `📅 Current week: ${label}\n\n🗓️ *This Week's Events:*\n\n${lines.join("\n")}`;
             }
           }
-        } else if (/^\/goals(\b.*)?$/i.test(text)) {
-          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
-          if (!userDoc.exists) {
-            reply = "❌ You haven't linked your account yet. Use /link <email>";
-          } else {
-            const uid = userDoc.data().uid;
-            if (!uid) {
-              reply = "❌ Your account is pending verification. Try again later.";
-            } else {
-              const goals = await fetchMainGoalsForUser(uid);
-              const currentGoals = goals.filter((goal) => goal.status !== "done");
-              if (currentGoals.length === 0) {
-                reply = "📋 No main goals set yet.";
-              } else {
-                const lines = currentGoals.map((goal, index) => formatMainGoal(goal, index));
-                reply = "📋 *Main Goals:*\n\n" + lines.join("\n");
-              }
-            }
-          }
-        } else if (/^\/events(\b.*)?$/i.test(text)) {
-          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
-          if (!userDoc.exists) {
-            reply = "❌ You haven't linked your account yet. Use /link <email>";
-          } else {
-            const uid = userDoc.data().uid;
-            if (!uid) {
-              reply = "❌ Your account is pending verification. Try again later.";
-            } else {
-              const events = await fetchEventsFromToday(uid);
-              if (events.length === 0) {
-                reply = "🗓️ No upcoming events.";
-              } else {
-                const lines = events.map((event, index) => formatEventLine(event, index));
-                reply = "🗓️ *Upcoming Events:*\n\n" + lines.join("\n");
-              }
-            }
-          }
-        } else if (/^\/targets(\b.*)?$/i.test(text)) {
-          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
-          if (!userDoc.exists) {
-            reply = "❌ You haven't linked your account yet. Use /link <email>";
-          } else {
-            const uid = userDoc.data().uid;
-            if (!uid) {
-              reply = "❌ Your account is pending verification. Try again later.";
-            } else {
-              const targets = await fetchTargetsForUser(uid, ["current", "recurring"]);
-              if (targets.length === 0) {
-                reply = "🎯 No current targets set.";
-              } else {
-                const lines = targets.map((target, index) => formatTargetLine(target, index));
-                reply = "🎯 *Current Targets:*\n\n" + lines.join("\n");
-              }
-            }
-          }
-        } else if (/^\/plan(\b.*)?$/i.test(text)) {
-          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
-          if (!userDoc.exists) {
-            reply = "❌ You haven't linked your account yet. Use /link <email>";
-          } else {
-            const uid = userDoc.data().uid;
-            if (!uid) {
-              reply = "❌ Your account is pending verification. Try again later.";
-            } else {
-              const trailingText = text.replace(/^\/plan\s*/i, "").trim();
-              const apiKey = process.env.LLM_API_KEY;
-              if (!apiKey) {
-                reply = "❌ LLM is not configured.";
-              } else {
-                const contextPrompt = await buildContextPrompt(uid, "plan", trailingText);
-                const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${apiKey}`,
-                  },
-                  body: JSON.stringify({
-                    model: "big-pickle",
-                    messages: [
-                      {role: "system", content: BASE_SYSTEM_PROMPT},
-                      {role: "user", content: contextPrompt.userMessage},
-                    ],
-                    tools: TOOLS,
-                    tool_choice: "auto",
-                  }),
-                });
-                if (response.ok) {
-                  const data = await response.json();
-                  reply = data.choices?.[0]?.message?.content || "✅ Done.";
-                } else {
-                  reply = "❌ AI service unavailable.";
-                }
-              }
-            }
-          }
-        } else if (/^\/archive$/i.test(text)) {
-          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
-          if (!userDoc.exists) {
-            reply = "❌ You haven't linked your account yet. Use /link <email>";
-          } else {
-            const uid = userDoc.data().uid;
-            if (!uid) {
-              reply = "❌ Your account is pending verification. Try again later.";
-            } else {
-              const today = getCurrentDate();
-              const weekOf = getCurrentWeekMonday();
-              const weekEnd = getCurrentWeekSunday();
-              const weekStartMs = new Date(weekOf + "T00:00:00").getTime();
-              const weekEndMs = new Date(weekEnd + "T00:00:00").getTime();
-              let targetsArchived = 0;
-              let eventsArchived = 0;
-              let goalsArchived = 0;
 
-              // Archive current targets
-              const targetsSnap = await db.collection("users").doc(String(uid)).collection("targets")
-                  .where("status", "==", "current")
-                  .get();
-              const goalsSnap = await db.collection("users").doc(String(uid)).collection("goals").get();
-              const goalsMap = {};
-              goalsSnap.forEach((doc) => { goalsMap[doc.id] = doc.data(); });
+        // ── Shared commands — delegate to processMessage ──
 
-              for (const tDoc of targetsSnap.docs) {
-                const t = tDoc.data();
-                const goal = t.mainGoalId ? goalsMap[t.mainGoalId] : null;
-                await db.collection("archives").add({
-                  userId: uid,
-                  type: "target",
-                  name: t.text,
-                  weekStart: weekStartMs,
-                  weekEnd: weekEndMs,
-                  goalId: t.mainGoalId || null,
-                  goalTitle: goal ? goal.title : null,
-                  archivedAt: FieldValue.serverTimestamp(),
-                });
-                await tDoc.ref.delete();
-                targetsArchived++;
-              }
-
-              // Archive past events
-              const eventsSnap = await db.collection("users").doc(String(uid)).collection("events")
-                  .where("date", "<", today)
-                  .get();
-              for (const eDoc of eventsSnap.docs) {
-                const e = eDoc.data();
-                const eDateMs = new Date(e.date + "T00:00:00").getTime();
-                await db.collection("archives").add({
-                  userId: uid,
-                  type: "event",
-                  name: e.title,
-                  weekStart: eDateMs,
-                  weekEnd: eDateMs,
-                  archivedAt: FieldValue.serverTimestamp(),
-                });
-                await eDoc.ref.delete();
-                eventsArchived++;
-              }
-
-              // Archive completed goals
-              const doneGoalsSnap = await db.collection("users").doc(String(uid)).collection("goals")
-                  .where("status", "==", "done")
-                  .get();
-              for (const gDoc of doneGoalsSnap.docs) {
-                const g = gDoc.data();
-                await db.collection("archives").add({
-                  userId: uid,
-                  type: "goal",
-                  name: g.title,
-                  weekStart: weekStartMs,
-                  weekEnd: weekEndMs,
-                  archivedAt: FieldValue.serverTimestamp(),
-                });
-                await gDoc.ref.delete();
-                goalsArchived++;
-              }
-
-              reply = `📦 Archived: ${targetsArchived} target(s), ${eventsArchived} event(s), ${goalsArchived} goal(s)`;
-            }
-          }
         } else {
-        // Default: show available commands
-          reply = "Commands:\n" +
-          "/link <email> - Link Telegram to your account\n" +
-          "/today - Show today's date\n" +
-          "/goals - Show your current main goals\n" +
-          "/targets - Show your current targets\n" +
-          "/events - Show upcoming events (today onward)\n" +
-          "/week - Show current week date range and events\n" +
-          "/tplan - Generate new targets for this week\n" +
-          "/plan - Create a daily schedule from current targets\n" +
-          "/archive - Archive current targets, past events, and completed goals\n" +
-          "/start - Show this help";
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists) {
+            reply = "❌ You haven't linked your account yet. Use /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            if (!uid) {
+              reply = "❌ Your account is pending verification. Try again later.";
+            } else {
+              const result = await processMessage(uid, text, {context: "telegram"});
+              reply = result.reply;
+            }
+          }
         }
 
         // Send reply via Telegram API
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: reply,
-            parse_mode: "Markdown",
-          }),
-        });
+        await sendTelegramMessage(chatId, reply, token, "Markdown");
       } catch (err) {
         logger.error("Error handling Telegram update", err);
       }
@@ -1123,324 +1301,18 @@ exports.telegramWebhook = onRequest(
 exports.chatWithLLM = onCall(
     {maxInstances: 10, region: "asia-southeast1"},
     async (request) => {
-      const {messages} = request.data;
       const uid = request.auth?.uid;
-
       if (!uid) {
-        return {reply: "Authentication required. Please sign in.", model: "opencode/big-pickle", systemMessage: null};
-      }
-      if (!messages || !Array.isArray(messages) || messages.length === 0) {
-        return {reply: "No messages provided.", model: "opencode/big-pickle", systemMessage: null};
+        return {reply: "Authentication required. Please sign in.", model: "opencode/big-pickle", systemMessage: null, messages: []};
       }
 
-      const apiKey = process.env.LLM_API_KEY;
-      if (!apiKey) {
-        logger.error("LLM_API_KEY not configured");
-        return {reply: "LLM is not configured. Please set up the API key.", model: "opencode/big-pickle", systemMessage: null};
+      const {text} = request.data;
+      if (!text || typeof text !== "string" || text.trim().length === 0) {
+        return {reply: "No message provided.", model: "opencode/big-pickle", systemMessage: null, messages: []};
       }
 
-      logger.info(`chatWithLLM called by user ${uid}, ${messages.length} messages`);
-
-      try {
-        const conversationMessages = messages.filter((message) => message.role !== "system");
-        let enhancedMessages = [...conversationMessages];
-        const lastMsg = enhancedMessages[enhancedMessages.length - 1];
-        const lastContent = lastMsg?.role === "user" ? (lastMsg.content || "") : "";
-        let systemMessage = BASE_SYSTEM_PROMPT;
-
-        // ── /archive command ──
-        const archiveMatch = lastContent.match(/^\/archive$/i);
-        if (archiveMatch) {
-          const today = getCurrentDate();
-          const weekOf = getCurrentWeekMonday();
-          const weekEnd = getCurrentWeekSunday();
-          const weekStartMs = new Date(weekOf + "T00:00:00").getTime();
-          const weekEndMs = new Date(weekEnd + "T00:00:00").getTime();
-          let targetsArchived = 0;
-          let eventsArchived = 0;
-          let goalsArchived = 0;
-
-          // Archive current targets
-          const targetsSnap = await db.collection("users").doc(uid).collection("targets")
-              .where("status", "==", "current").get();
-          const goalsSnap = await db.collection("users").doc(uid).collection("goals").get();
-          const goalsMap = {};
-          goalsSnap.forEach((doc) => { goalsMap[doc.id] = doc.data(); });
-
-          for (const tDoc of targetsSnap.docs) {
-            const t = tDoc.data();
-            const goal = t.mainGoalId ? goalsMap[t.mainGoalId] : null;
-            await db.collection("archives").add({
-              userId: uid,
-              type: "target",
-              name: t.text,
-              weekStart: weekStartMs,
-              weekEnd: weekEndMs,
-              goalId: t.mainGoalId || null,
-              goalTitle: goal ? goal.title : null,
-              archivedAt: FieldValue.serverTimestamp(),
-            });
-            await tDoc.ref.delete();
-            targetsArchived++;
-          }
-
-          // Archive past events (today and before)
-          const eventsSnap = await db.collection("users").doc(uid).collection("events")
-              .where("date", "<=", today).get();
-          for (const eDoc of eventsSnap.docs) {
-            const e = eDoc.data();
-            await db.collection("archives").add({
-              userId: uid,
-              type: "event",
-              name: e.title,
-              weekStart: new Date(e.date + "T00:00:00").getTime(),
-              weekEnd: new Date(e.date + "T00:00:00").getTime(),
-              archivedAt: FieldValue.serverTimestamp(),
-            });
-            await eDoc.ref.delete();
-            eventsArchived++;
-          }
-
-          // Archive completed goals
-          const doneGoalsSnap = await db.collection("users").doc(uid).collection("goals")
-              .where("status", "==", "done").get();
-          for (const gDoc of doneGoalsSnap.docs) {
-            await db.collection("archives").add({
-              userId: uid,
-              type: "goal",
-              name: gDoc.data().title,
-              weekStart: weekStartMs,
-              weekEnd: weekEndMs,
-              archivedAt: FieldValue.serverTimestamp(),
-            });
-            await gDoc.ref.delete();
-            goalsArchived++;
-          }
-
-          return {
-            reply: `📦 Archived: ${targetsArchived} target(s), ${eventsArchived} event(s), ${goalsArchived} goal(s)`,
-            model: "archive",
-            systemMessage: null,
-            steps: [
-              {tool: "ArchiveTargets"},
-              {tool: "ArchiveEvents"},
-              {tool: "ArchiveMainGoals"},
-            ],
-          };
-        }
-
-        // ── /tplan command ──
-        const tplanMatch = lastContent.match(/^\/tplan\b\s*(.*)$/i);
-        if (tplanMatch) {
-          const trailingText = tplanMatch[1]?.trim() || "";
-          const contextPrompt = await buildContextPrompt(uid, "tplan", trailingText);
-          enhancedMessages = [
-            {role: "system", content: BASE_SYSTEM_PROMPT},
-            ...enhancedMessages,
-            {role: "user", content: contextPrompt.userMessage},
-          ];
-          systemMessage = BASE_SYSTEM_PROMPT;
-        // ── /plan command ──
-        } else {
-          const planMatch = lastContent.match(/^\/plan\b\s*(.*)$/i);
-          if (planMatch) {
-            const trailingText = planMatch[1]?.trim() || "";
-            const contextPrompt = await buildContextPrompt(uid, "plan", trailingText);
-            enhancedMessages = [
-              {role: "system", content: BASE_SYSTEM_PROMPT},
-              ...enhancedMessages,
-              {role: "user", content: contextPrompt.userMessage},
-            ];
-            systemMessage = BASE_SYSTEM_PROMPT;
-          } else {
-            const commandMatch = lastContent.match(/^\/(goals|events|targets)\b\s*(.*)$/i);
-            if (commandMatch) {
-              const command = commandMatch[1]?.toLowerCase();
-              const trailingText = commandMatch[2]?.trim() || "";
-              const contextPrompt = await buildContextPrompt(uid, command, trailingText);
-              enhancedMessages = [
-                {role: "system", content: BASE_SYSTEM_PROMPT},
-                ...enhancedMessages,
-                {role: "user", content: contextPrompt.userMessage},
-              ];
-              systemMessage = BASE_SYSTEM_PROMPT;
-            } else {
-              enhancedMessages = [
-                {role: "system", content: BASE_SYSTEM_PROMPT},
-                ...enhancedMessages,
-              ];
-              systemMessage = BASE_SYSTEM_PROMPT;
-            }
-          }
-        }
-
-        const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: "big-pickle",
-            messages: enhancedMessages,
-            tools: TOOLS,
-            tool_choice: "auto",
-          }),
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          logger.error(`OpenCode Zen API error: ${response.status} ${errorText}`);
-          return {
-            reply: `Sorry, the AI service returned an error (${response.status}). Please try again later.`,
-            model: "opencode/big-pickle",
-            systemMessage,
-          };
-        }
-
-        const data = await response.json();
-        const choice = data.choices?.[0]?.message;
-
-        logger.info(`LLM response: tool_calls=${JSON.stringify(choice?.tool_calls?.length || 0)}, content_length=${(choice?.content || "").length}, finish_reason=${data.choices?.[0]?.finish_reason}`);
-
-        // Resolve tool calls: prefer native API format, fall back to XML parsing
-        let toolCalls = choice?.tool_calls && choice.tool_calls.length > 0
-          ? choice.tool_calls
-          : parseXmlToolCalls(choice?.content || "");
-
-        // Check if the LLM wants to call tools
-        if (toolCalls.length > 0) {
-          logger.info(`Executing ${toolCalls.length} tool call(s):`, toolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
-
-          // Execute all tool calls
-          const toolResults = [];
-          const steps = [];
-          const toolOutputs = [];
-          for (const toolCall of toolCalls) {
-            const result = await handleToolCall(toolCall, uid);
-            toolResults.push(result);
-            steps.push({tool: `${toolCall.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
-            const output = formatToolResult(toolCall.function.name, result.result);
-            if (output) toolOutputs.push(output);
-          }
-
-          // Strip XML tool call blocks from content before follow-up
-          let cleanContent = choice?.content || "";
-          if (choice?.tool_calls === undefined || (choice?.tool_calls && choice.tool_calls.length === 0)) {
-            cleanContent = cleanContent.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
-          }
-
-          // Build assistant message with proper tool_calls format
-          const assistantMsg = choice?.tool_calls && choice.tool_calls.length > 0
-            ? {role: "assistant", content: choice.content || null, tool_calls: choice.tool_calls}
-            : {role: "assistant", content: cleanContent || "Let me check that for you."};
-
-          // Initial conversation for follow-up rounds
-          let conversationMessages = [
-            ...enhancedMessages,
-            assistantMsg,
-            ...toolResults.map((tr) => ({
-              role: "tool",
-              tool_call_id: tr.toolCallId,
-              content: JSON.stringify(tr.result),
-            })),
-          ];
-
-          // Multi-step tool loop: up to 5 rounds of tool execution
-          let finalReply = null;
-          for (let round = 0; round < 5; round++) {
-            const body = {model: "big-pickle", messages: conversationMessages, tools: TOOLS};
-
-            const followUpResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`,
-              },
-              body: JSON.stringify(body),
-            });
-
-            if (!followUpResponse.ok) {
-              const errorText = await followUpResponse.text();
-              logger.error(`OpenCode Zen API follow-up error: ${followUpResponse.status} ${errorText}`);
-              const summaries = steps.map((s) => s.tool).join("\n");
-              const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
-              return {reply: `${listPrefix}I've completed the following actions:\n${summaries}`, steps, model: "opencode/big-pickle", systemMessage};
-            }
-
-            const data = await followUpResponse.json();
-            const msg = data.choices?.[0]?.message;
-            const nextToolCalls = msg?.tool_calls && msg.tool_calls.length > 0
-              ? msg.tool_calls
-              : parseXmlToolCalls(msg?.content || "");
-
-            // No more tool calls — return text response
-            if (nextToolCalls.length === 0) {
-              finalReply = msg?.content || "Actions completed.";
-              break;
-            }
-
-            // Execute next round of tool calls
-            logger.info(`Round ${round + 2}: executing ${nextToolCalls.length} tool call(s):`, nextToolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
-
-            const nextAssistantMsg = msg?.tool_calls && msg.tool_calls.length > 0
-              ? {role: "assistant", content: msg.content || null, tool_calls: msg.tool_calls}
-              : {role: "assistant", content: msg?.content || ""};
-
-            conversationMessages = [
-              ...conversationMessages,
-              nextAssistantMsg,
-            ];
-
-            for (const tc of nextToolCalls) {
-              const result = await handleToolCall(tc, uid);
-              steps.push({tool: `${tc.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
-              const output = formatToolResult(tc.function.name, result.result);
-              if (output) toolOutputs.push(output);
-              conversationMessages.push({
-                role: "tool",
-                tool_call_id: result.toolCallId,
-                content: JSON.stringify(result.result),
-              });
-            }
-          }
-
-          // Force a summary response if the loop ended without a text reply
-          if (!finalReply) {
-            conversationMessages.push({role: "user", content: "Summarize what you just did for the user in a natural, friendly way."});
-            const summaryResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`,
-              },
-              body: JSON.stringify({model: "big-pickle", messages: conversationMessages}),
-            });
-            if (summaryResponse.ok) {
-              const summaryData = await summaryResponse.json();
-              finalReply = summaryData.choices?.[0]?.message?.content || "Actions completed.";
-            } else {
-              const summaries = steps.map((s) => s.tool).join("\n");
-              finalReply = `I've completed the following actions:\n${summaries}`;
-            }
-          }
-
-          const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
-          return {reply: `${listPrefix}${finalReply || "Actions completed."}`, steps, model: "opencode/big-pickle", systemMessage};
-        }
-
-        // No tool calls — return the LLM's text response as before
-        const reply = choice?.content || "No response from AI.";
-        logger.info(`chatWithLLM success for user ${uid}`);
-        return {reply, model: "opencode/big-pickle", systemMessage};
-      } catch (err) {
-        logger.error("chatWithLLM fetch error", err);
-        return {
-          reply: "Sorry, an error occurred while contacting the AI service. Please check your network and try again.",
-          model: "opencode/big-pickle",
-          systemMessage: null,
-        };
-      }
+      logger.info(`chatWithLLM called by user ${uid}`);
+      return await processMessage(uid, text, {context: "web"});
     },
 );
 

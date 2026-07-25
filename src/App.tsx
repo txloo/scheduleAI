@@ -3,10 +3,13 @@ import { User } from "firebase/auth";
 import { onAuthChange } from "./lib/firebase";
 import Auth from "./components/Auth";
 import Dashboard from "./components/Dashboard";
+import Notes from "./components/Notes";
+import { AppView } from "./types";
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [view, setView] = useState<AppView>("dashboard");
 
   useEffect(() => {
     const unsub = onAuthChange((u) => {
@@ -28,5 +31,9 @@ export default function App() {
     return <Auth />;
   }
 
-  return <Dashboard user={user} />;
+  if (view === "notes") {
+    return <Notes userId={user.uid} onBack={() => setView("dashboard")} />;
+  }
+
+  return <Dashboard user={user} onNavigate={setView} />;
 }

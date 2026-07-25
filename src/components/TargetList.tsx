@@ -7,6 +7,7 @@ import {
   deleteDoc,
   doc,
   Timestamp,
+  deleteField,
 } from "firebase/firestore";
 import { db } from "../lib/firebase";
 import { Target, TargetStatus, MainGoal } from "../types";
@@ -27,6 +28,30 @@ const STATUS_OPTIONS: { value: TargetStatus; label: string }[] = [
   { value: "recurring", label: "Recurring" },
 ];
 
+function getCurrentMonday(): string {
+  const d = new Date();
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(d);
+  monday.setDate(diff);
+  const y = monday.getFullYear();
+  const m = String(monday.getMonth() + 1).padStart(2, "0");
+  const dd = String(monday.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+function getMondayOf(dateStr: string): string {
+  const d = new Date(dateStr + "T00:00:00");
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(d);
+  monday.setDate(diff);
+  const y = monday.getFullYear();
+  const m = String(monday.getMonth() + 1).padStart(2, "0");
+  const dd = String(monday.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
 const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, mainGoals }, ref) => {
   const [targets, setTargets] = useState<Target[]>([]);
   const [text, setText] = useState("");
@@ -34,14 +59,17 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
   const [estimatedHours, setEstimatedHours] = useState(1);
   const [status, setStatus] = useState<TargetStatus>("current");
   const [selectedMainGoalId, setSelectedMainGoalId] = useState("");
+  const [weekOf, setWeekOf] = useState(getCurrentMonday);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
   const [editPriority, setEditPriority] = useState(3);
   const [editEstimatedHours, setEditEstimatedHours] = useState(1);
   const [editStatus, setEditStatus] = useState<TargetStatus>("current");
   const [editMainGoalId, setEditMainGoalId] = useState("");
+  const [editWeekOf, setEditWeekOf] = useState("");
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteTargetName, setDeleteTargetName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   async function fetchTargets() {
     const snap = await getDocs(collection(db, "users", userId, "targets"));
@@ -50,7 +78,12 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
       const data = d.data() as Omit<Target, "id">;
       list.push({ id: d.id, ...data });
     });
-    list.sort((a, b) => b.priority - a.priority);
+    list.sort((a, b) => {
+      const aWeek = a.weekOf || getCurrentMonday();
+      const bWeek = b.weekOf || getCurrentMonday();
+      if (aWeek !== bWeek) return aWeek.localeCompare(bWeek);
+      return b.priority - a.priority;
+    });
     setTargets(list);
   }
 
@@ -61,21 +94,31 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
   }, [userId]);
 
   async function addTarget() {
-    if (!text.trim()) return;
-    await addDoc(collection(db, "users", userId, "targets"), {
-      text: text.trim(),
-      priority,
-      estimatedHours,
-      status,
-      mainGoalId: selectedMainGoalId || undefined,
-      createdAt: Timestamp.now(),
-    });
-    setText("");
-    setPriority(3);
-    setEstimatedHours(1);
-    setStatus("current");
-    setSelectedMainGoalId("");
-    fetchTargets();
+    if (!text.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      const data: Record<string, unknown> = {
+        text: text.trim(),
+        priority,
+        estimatedHours,
+        status,
+        weekOf: weekOf || getCurrentMonday(),
+        createdAt: Timestamp.now(),
+      };
+      if (selectedMainGoalId) {
+        data.mainGoalId = selectedMainGoalId;
+      }
+      await addDoc(collection(db, "users", userId, "targets"), data);
+      setText("");
+      setPriority(3);
+      setEstimatedHours(1);
+      setStatus("current");
+      setSelectedMainGoalId("");
+      setWeekOf(getCurrentMonday());
+      fetchTargets();
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   function startEdit(target: Target) {
@@ -85,6 +128,7 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
     setEditEstimatedHours(target.estimatedHours);
     setEditStatus(target.status);
     setEditMainGoalId(target.mainGoalId || "");
+    setEditWeekOf(target.weekOf || getCurrentMonday());
   }
 
   function cancelEdit() {
@@ -94,6 +138,7 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
     setEditEstimatedHours(1);
     setEditStatus("current");
     setEditMainGoalId("");
+    setEditWeekOf("");
   }
 
   async function saveEdit(id: string) {
@@ -103,11 +148,12 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
       priority: editPriority,
       estimatedHours: editEstimatedHours,
       status: editStatus,
+      weekOf: editWeekOf || getCurrentMonday(),
     };
     if (editMainGoalId) {
       updates.mainGoalId = editMainGoalId;
     } else {
-      updates.mainGoalId = null;
+      updates.mainGoalId = deleteField();
     }
     await updateDoc(doc(db, "users", userId, "targets", id), updates);
     setEditingId(null);
@@ -130,7 +176,8 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
     return mainGoals.find((mg) => mg.id === goalId)?.title;
   }
 
-  const currentTargets = targets.filter((t) => t.status === "current" || t.status === "recurring");
+  const currentTargets = targets.filter((t) => t.status === "current");
+  const recurringTargets = targets.filter((t) => t.status === "recurring");
   const upcomingTargets = targets.filter((t) => t.status === "upcoming");
 
   function renderTarget(target: Target) {
@@ -244,9 +291,19 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
             ))}
           </select>
         </div>
+        <div>
+          <label className="text-xs text-gray-500">Target week (optional)</label>
+          <input
+            type="date"
+            value={weekOf}
+            onChange={(e) => setWeekOf(getMondayOf(e.target.value))}
+            className="w-full border rounded px-2 py-1 text-sm"
+          />
+          <p className="text-xs text-gray-400 mt-0.5">Defaults to this week. Used for sort order within same priority.</p>
+        </div>
         <button
           onClick={addTarget}
-          disabled={!text.trim()}
+          disabled={!text.trim() || submitting}
           className="w-full bg-green-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-green-700 disabled:opacity-50 transition"
         >
           + Add Target
@@ -263,6 +320,19 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
             {currentTargets.map((t) => renderTarget(t))}
             {currentTargets.length === 0 && (
               <p className="text-gray-400 text-sm">No current targets</p>
+            )}
+          </div>
+        </div>
+
+        {/* Recurring Targets */}
+        <div>
+          <h3 className="text-xs font-semibold text-gray-500 uppercase mb-1">
+            Recurring ({recurringTargets.length})
+          </h3>
+          <div className="space-y-0">
+            {recurringTargets.map((t) => renderTarget(t))}
+            {recurringTargets.length === 0 && (
+              <p className="text-gray-400 text-sm">No recurring targets</p>
             )}
           </div>
         </div>
@@ -340,6 +410,15 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
                 <option key={mg.id} value={mg.id}>{mg.title}</option>
               ))}
             </select>
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">Target week</label>
+            <input
+              type="date"
+              value={editWeekOf}
+              onChange={(e) => setEditWeekOf(getMondayOf(e.target.value))}
+              className="w-full border rounded px-2 py-1 text-sm"
+            />
           </div>
           <div className="flex gap-2">
             <button

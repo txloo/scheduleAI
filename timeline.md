@@ -13,3 +13,37 @@ To append: read last line, add new line below. To find incomplete items: grep fo
 2026-07-19 ✅ Chat pre-fetch (loads chat history on dashboard mount, hides initial scroll)
 
 2026-07-20 ✅ Firestore subcollection migration (users/{uid}/{collection}) — events, targets, goals moved from top-level collections to per-user subcollections; mainGoals renamed to goals; documentation updated to match code
+
+2026-07-23 ✅ /archive command in web chat (archiving current targets, past events, completed goals)
+2026-07-23 ✅ Chat closes on outside click (backdrop overlay)
+2026-07-23 ✅ Double-click goal status cycling with 2s debounce
+2026-07-23 ✅ Fix addTarget/saveEdit empty mainGoalId handling
+2026-07-23 ✅ Target list split into Current, Recurring, Upcoming sections
+2026-07-23 ✅ Event list grouped by day with text-only layout
+2026-07-23 ✅ Event list scrollable height matched to target list
+
+2026-07-24 ✅ Today's Events section (read-only, displays today's events with archive button)
+2026-07-24 ✅ Single event fetch architecture (Dashboard fetches once, passes filtered subsets to children)
+2026-07-24 ✅ New layout: Today's Events → Main Goals → Targets + WeekPicker/Events (side-by-side)
+2026-07-24 ✅ View mode toggle with 3 modes (targets-first, events-first, tabbed)
+2026-07-24 ✅ URL persistence for view mode (?view=targets-first|events-first|tabbed)
+2026-07-24 ✅ Tabbed view with tab switching between Targets and Events
+2026-07-24 ✅ Mobile responsive: Targets wraps above WeekPicker+Events on mobile
+2026-07-24 ✅ Main Goals wrap to 2-column grid on mobile (no horizontal scroll)
+2026-07-24 ✅ Goals sorted by creation date (oldest first)
+
+2026-07-24 ✅ Fix goal sort — Timestamp-aware toMs() helper for Firestore Timestamp objects
+2026-07-24 ✅ Chat history navigation (up/down arrows cycle through previous user messages)
+2026-07-24 ✅ Chat horizontal scroll fix (overflow-x-hidden on messages area)
+2026-07-24 ✅ Target weekOf field — manual ISO Monday date for sort ordering within same priority
+2026-07-24 ✅ LLM tool definitions updated for weekOf (createTarget, updateTarget, system prompt)
+2026-07-24 ✅ MainGoalList clickable status badge — works on mobile (replaces unreliable onDoubleClick)
+2026-07-24 ✅ Goal status rapid-click fix — ref-based optimistic statuses prevent stale state
+2026-07-24 ✅ Chat click-to-copy — tap bubble to copy text with "Copied!" indicator
+2026-07-24 ✅ weekOf shown in LLM context — /targets and listTargets tool results include Week of date
+2026-07-24 ✅ Chat history moved to Cloud Functions — processMessage fetches/persists/clears RTDB history; client sends text only
+2026-07-24 ✅ Telegram Thinking indicator — sendMessage("🤔 Thinking...") before command processing, response as second message
+2026-07-24 ✅ Telegram history unified via processMessage — context param ("web"/"telegram") routes to correct RTDB path
+2026-07-24 ✅ RTDB + Firestore rules hardened — prompts restricted to auth users, telegramUsers list permission added
+2026-07-24 ✅ /week expansion — injects events, targets, goals into chat message and saves to history; updated command lists in web chat and Telegram /start
+2026-07-24 ✅ Chat fixes — double welcome message fix, scroll-to-bottom button replacing auto-scroll, ID in formatEventLine/formatTargetLine, weekOf snapped to Monday in datepicker and tool calls, Telegram long message splitting

@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { httpsCallable } from "firebase/functions";
 import { rtdb, functions } from "../lib/firebase";
-import { ref, set, get } from "firebase/database";
+import { ref, get } from "firebase/database";
 
 interface ChatPanelProps {
   userId: string;
@@ -17,9 +17,11 @@ const WELCOME_MESSAGE = {
 const COMMANDS = [
   { command: "/plan", description: "Generate a weekly plan" },
   { command: "/tplan", description: "Generate new targets for the week" },
+  { command: "/week", description: "Show this week's events, targets, and goals" },
   { command: "/goals", description: "Show your current main goals" },
   { command: "/targets", description: "Show your current targets" },
   { command: "/events", description: "Show upcoming events" },
+  { command: "/archive", description: "Archive current targets, past events, completed goals" },
   { command: "/help", description: "Show all available commands" },
   { command: "/clear", description: "Reset chat history" },
 ];
@@ -37,8 +39,10 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [transientMessage, setTransientMessage] = useState<string | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const isInitialLoad = useRef(true);
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const [showScrollButton, setShowScrollButton] = useState(false);
+  const historyIndex = useRef(-1);
 
   useEffect(() => {
     async function fetchMessages() {
@@ -55,29 +59,36 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
     fetchMessages();
   }, [userId]);
 
-  // Auto-scroll to bottom on new messages (skip initial render)
+  const handleScroll = () => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+    setShowScrollButton(!nearBottom);
+  };
+
+  const scrollToBottom = () => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    setShowScrollButton(false);
+  };
+
+  // When messages change, scroll to bottom if user was already near bottom
   useEffect(() => {
-    if (isInitialLoad.current) {
-      isInitialLoad.current = false;
-      return;
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+    if (nearBottom) {
+      el.scrollTop = el.scrollHeight;
+      setShowScrollButton(false);
+    } else {
+      setShowScrollButton(true);
     }
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+  }, [messages]);
 
   const handleSend = async () => {
     const trimmedInput = input.trim();
     if (!trimmedInput || loading) return;
-
-    if (/^\/clear$/i.test(trimmedInput)) {
-      setInput("");
-      setTransientMessage(null);
-      setMessages([WELCOME_MESSAGE]);
-      await set(ref(rtdb, `chats/${userId}`), {
-        messages: [WELCOME_MESSAGE],
-        updatedAt: Date.now(),
-      });
-      return;
-    }
 
     if (/^\/help$/i.test(trimmedInput)) {
       setInput("");
@@ -86,40 +97,29 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
     }
 
     const userMessage = { role: "user", content: trimmedInput };
-    const promptMessages = messages.filter((message) => message.role !== "system");
-    const updatedPromptMessages = [...promptMessages, userMessage];
-    const updatedMessages = [...messages, userMessage];
-    setMessages(updatedMessages);
+    setMessages((prev) => [...prev, userMessage]);
     setTransientMessage(null);
     setInput("");
+    historyIndex.current = -1;
     setLoading(true);
 
     try {
       const chatWithLLM = httpsCallable(functions, "chatWithLLM");
-      const result = await chatWithLLM({ messages: updatedPromptMessages });
-      const { reply, systemMessage, steps } = result.data as { reply: string; model: string; systemMessage?: string | null; steps?: { tool: string }[] };
+      const result = await chatWithLLM({ text: trimmedInput });
+      const { reply, steps, messages: newMessages } = result.data as { reply: string; model: string; steps?: { tool: string }[]; messages?: { role: string; content: string }[] };
 
-      const stepMessages = steps && steps.length > 0
-        ? [{ role: "assistant", content: steps.map((s) => s.tool).join("\n") }]
-        : [];
-      const assistantMessage = { role: "assistant", content: reply };
-      const lastSystemMessage = [...updatedMessages].reverse().find((message) => message.role === "system")?.content;
-      const nextMessages = systemMessage && systemMessage !== lastSystemMessage
-        ? [...updatedMessages, ...stepMessages, { role: "system", content: systemMessage }, assistantMessage]
-        : [...updatedMessages, ...stepMessages, assistantMessage];
+      // Use server-returned messages array (includes history + new exchange)
+      if (newMessages && Array.isArray(newMessages) && newMessages.length > 0) {
+        setMessages(newMessages);
+      } else {
+        // Fallback: append reply locally if server didn't return messages
+        const stepMessages = steps && steps.length > 0
+          ? [{ role: "assistant", content: steps.map((s) => s.tool).join("\n") }]
+          : [];
+        const assistantMessage = { role: "assistant", content: reply };
+        setMessages((prev) => [...prev, ...stepMessages, assistantMessage]);
+      }
 
-      // Sliding window: keep the welcome message + the most recent 30 entries
-      const finalMessages = nextMessages.length > 31
-        ? [nextMessages[0], ...nextMessages.slice(-30)]
-        : nextMessages;
-
-      // Persist to RTDB
-      await set(ref(rtdb, `chats/${userId}`), {
-        messages: finalMessages,
-        updatedAt: Date.now(),
-      });
-
-      setMessages(finalMessages);
       if (steps && steps.length > 0) {
         const toolNames = steps.map((s) => s.tool.split(":")[0].trim());
         onToolAction?.(toolNames);
@@ -146,9 +146,39 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
     }
   };
 
+  const handleCopy = (idx: number, content: string) => {
+    navigator.clipboard.writeText(content);
+    setCopiedIdx(idx);
+    setTimeout(() => setCopiedIdx(null), 2000);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       handleSend();
+      return;
+    }
+
+    const userMessages = messages.filter((m) => m.role === "user");
+
+    if (e.key === "ArrowUp") {
+      if (userMessages.length === 0) return;
+      e.preventDefault();
+      if (historyIndex.current === -1) {
+        historyIndex.current = userMessages.length - 1;
+      } else if (historyIndex.current > 0) {
+        historyIndex.current--;
+      }
+      setInput(userMessages[historyIndex.current].content);
+    } else if (e.key === "ArrowDown") {
+      if (historyIndex.current === -1) return;
+      e.preventDefault();
+      historyIndex.current++;
+      if (historyIndex.current >= userMessages.length) {
+        historyIndex.current = -1;
+        setInput("");
+      } else {
+        setInput(userMessages[historyIndex.current].content);
+      }
     }
   };
 
@@ -180,7 +210,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
       </div>
 
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div ref={messagesContainerRef} onScroll={handleScroll} className="relative flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-3">
         {messages.map((msg, idx) => {
           if (msg.role === "system") {
             return null;
@@ -192,13 +222,19 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
               className={`flex ${isUser ? "justify-end" : "justify-start"}`}
             >
               <div
-                className={`max-w-[75%] rounded-lg px-3 py-2 ${
+                onClick={() => handleCopy(idx, msg.content)}
+                className={`max-w-[75%] rounded-lg px-3 py-2 cursor-pointer select-none ${
                   isUser
                     ? "bg-blue-500 text-white"
                     : "bg-gray-100 text-gray-800"
                 }`}
               >
                 <div className="whitespace-pre-wrap">{msg.content}</div>
+                {copiedIdx === idx && (
+                  <div className={`text-xs mt-1 ${isUser ? "text-blue-200" : "text-gray-400"}`}>
+                    Copied!
+                  </div>
+                )}
                 {!isUser && (
                   <div className="text-xs text-gray-400 mt-1">
                     🤖 opencode/big-pickle
@@ -242,7 +278,14 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
           </div>
         )}
 
-        <div ref={messagesEndRef} />
+        {showScrollButton && (
+          <button
+            onClick={scrollToBottom}
+            className="sticky bottom-0 left-1/2 -translate-x-1/2 bg-gray-800 text-white rounded-full w-8 h-8 flex items-center justify-center shadow-lg hover:bg-gray-700 transition text-sm mx-auto"
+          >
+            ↓
+          </button>
+        )}
       </div>
 
       {/* Input bar */}
@@ -250,7 +293,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
         <input
           type="text"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => { setInput(e.target.value); historyIndex.current = -1; }}
           onKeyDown={handleKeyDown}
           placeholder="Type your message..."
           disabled={loading}

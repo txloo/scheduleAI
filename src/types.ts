@@ -28,6 +28,7 @@ export interface Target {
   status: TargetStatus;
   deadline?: string;
   mainGoalId?: string;
+  weekOf?: string; // ISO Monday date for sort ordering
   createdAt?: Date;
 }
 
@@ -35,4 +36,13 @@ export interface WeekRange {
   start: Date; // Monday
   end: Date; // Sunday
   label: string;
+}
+
+export type ViewMode = "targets-first" | "events-first" | "tabbed";
+
+export type AppView = "dashboard" | "notes";
+
+export interface Note {
+  id: string;
+  body: string;
 }

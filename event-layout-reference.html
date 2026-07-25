@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Event Layout Reference</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 24px; display: flex; justify-content: center; }
+    .card { width: 340px; background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e5e7eb; padding: 16px; overflow: hidden; }
+    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .card-title { font-size: 16px; font-weight: 600; }
+    .add-btn { background: #2563eb; color: white; border: none; border-radius: 4px; padding: 4px 10px; font-size: 12px; font-weight: 500; cursor: pointer; }
+    .day-group { margin-bottom: 12px; }
+    .day-group:last-child { margin-bottom: 0; }
+    .day-header { font-size: 11px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+    .event-row { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px solid #f3f4f6; position: relative; }
+    .event-row:last-child { border-bottom: none; }
+    .event-row:hover .delete-btn { opacity: 1; }
+    .event-time { font-size: 12px; color: #9ca3af; min-width: 80px; flex-shrink: 0; padding-top: 1px; }
+    .event-title { font-size: 13px; color: #111827; line-height: 1.4; }
+    .delete-btn { position: absolute; right: 0; top: 4px; background: none; border: none; color: #ef4444; font-size: 14px; cursor: pointer; opacity: 0; transition: opacity 0.15s; padding: 0 2px; }
+    .empty { font-size: 12px; color: #d1d5db; padding: 4px 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Events</span>
+      <button class="add-btn">+ Add</button>
+    </div>
+
+    <div class="day-group">
+      <div class="day-header">Mon, Jul 23</div>
+      <div class="event-row">
+        <div class="event-time">09:00–10:00</div>
+        <div class="event-title">Team Standup</div>
+        <button class="delete-btn">&times;</button>
+      </div>
+      <div class="event-row">
+        <div class="event-time">14:00–16:00</div>
+        <div class="event-title">Design Review with the engineering team and stakeholders</div>
+        <button class="delete-btn">&times;</button>
+      </div>
+    </div>
+
+    <div class="day-group">
+      <div class="day-header">Tue, Jul 24</div>
+      <div class="event-row">
+        <div class="event-time">11:00–12:00</div>
+        <div class="event-title">Lunch with Sarah</div>
+        <button class="delete-btn">&times;</button>
+      </div>
+      <div class="event-row">
+        <div class="event-time">17:00–18:30</div>
+        <div class="event-title">Gym Session</div>
+        <button class="delete-btn">&times;</button>
+      </div>
+    </div>
+
+    <div class="day-group">
+      <div class="day-header">Wed, Jul 25</div>
+      <p class="empty">No events</p>
+    </div>
+
+    <div class="day-group">
+      <div class="day-header">Thu, Jul 26</div>
+      <div class="event-row">
+        <div class="event-time">09:00–17:00</div>
+        <div class="event-title">All Day Workshop with the design team and external consultants</div>
+        <button class="delete-btn">&times;</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
