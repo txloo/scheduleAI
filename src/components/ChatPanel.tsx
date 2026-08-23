@@ -17,7 +17,10 @@ const WELCOME_MESSAGE = {
 const COMMANDS = [
   { command: "/plan", description: "Generate a weekly plan" },
   { command: "/tplan", description: "Generate new targets for the week" },
-  { command: "/week", description: "Show this week's events, targets, and goals" },
+  { command: "/week", description: "Show current week date range" },
+  { command: "/current", description: "Show current targets" },
+  { command: "/upcoming", description: "Show upcoming targets" },
+  { command: "/recurring", description: "Show recurring targets" },
   { command: "/goals", description: "Show your current main goals" },
   { command: "/targets", description: "Show your current targets" },
   { command: "/events", description: "Show upcoming events" },

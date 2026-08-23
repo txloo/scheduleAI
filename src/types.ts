@@ -38,8 +38,6 @@ export interface WeekRange {
   label: string;
 }
 
-export type ViewMode = "targets-first" | "events-first" | "tabbed";
-
 export type AppView = "dashboard" | "notes";
 
 export interface Note {

@@ -47,3 +47,14 @@ To append: read last line, add new line below. To find incomplete items: grep fo
 2026-07-24 ✅ RTDB + Firestore rules hardened — prompts restricted to auth users, telegramUsers list permission added
 2026-07-24 ✅ /week expansion — injects events, targets, goals into chat message and saves to history; updated command lists in web chat and Telegram /start
 2026-07-24 ✅ Chat fixes — double welcome message fix, scroll-to-bottom button replacing auto-scroll, ID in formatEventLine/formatTargetLine, weekOf snapped to Monday in datepicker and tool calls, Telegram long message splitting
+
+2026-07-26 ✅ Notes — click-to-copy, delete with confirmation, centralized data fetching in App.tsx
+2026-07-26 ✅ Notes AI tools — listNotes and createNote in Cloud Functions, system prompt updated
+2026-07-26 ✅ Removed view toggle — fixed layout: events left/targets right on desktop, targets above/events below on mobile
+
+2026-07-27 ✅ Notes layout fix — replaced horizontal scroll with flex-wrap grid (2 cols mobile, 3 cols desktop), visible delete button
+2026-07-27 ✅ Telegram commands — /week now shows date range only; added /current, /upcoming, /recurring for target filtering
+2026-07-27 ✅ Mobile back button — closes chat when open, returns to dashboard from notes; delete button color fixed
+2026-07-27 ✅ Telegram link approval flow — /link creates a pending request; web dashboard Approve/Dismiss sets uid; telegramUsers Firestore rules added
+2026-07-27 ✅ WeekOverview popup — floating button shows this week's targets + today's events within the next 3 hours
+2026-07-27 ✅ Chat /help command — command list + command chips shown on first open

@@ -2,6 +2,7 @@ const {onCall, onRequest} = require("firebase-functions/https");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const {FieldValue} = require("firebase-admin/firestore");
+const crypto = require("crypto");
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -215,6 +216,35 @@ const TOOLS = [
       },
     },
   },
+  // ── Notes ──
+  {
+    type: "function",
+    function: {
+      name: "listNotes",
+      description: "List notes for the user. Optionally fetch a single note by ID.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {type: "string", description: "Optional note ID. If provided, returns only that note. If omitted, returns all notes."},
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "createNote",
+      description: "Create a new note for the user",
+      parameters: {
+        type: "object",
+        properties: {
+          body: {type: "string", description: "The note content"},
+        },
+        required: ["body"],
+      },
+    },
+  },
 ];
 
 const BASE_SYSTEM_PROMPT = [
@@ -226,6 +256,7 @@ const BASE_SYSTEM_PROMPT = [
   "- Main Goals: Long-term, aspirational objectives that span weeks or months (e.g. \"Launch my startup\", \"Get fit\"). They have a title, optional description, optional target date, and status (not_started, in_progress, done). Use createMainGoal / updateMainGoal / deleteMainGoal / listMainGoals.",
   "- Targets: Short-term, actionable tasks for the current week (e.g. \"Finish report\", \"Exercise 3x\"). They have a text description, priority 1-5, estimated hours, and status (current, upcoming, recurring). Targets can be linked to a Main Goal via mainGoalId. Targets have an optional weekOf field (ISO Monday date) used for sort order within the same priority — when creating targets for a future week, set weekOf to that week's Monday. Use createTarget / updateTarget / deleteTarget / listTargets.",
   "- Events: Fixed calendar appointments with a specific date and time range (e.g. \"Team meeting, July 15, 09:00-10:00\"). Use createEvent / updateEvent / deleteEvent / listEvents.",
+  "- Notes: Short text snippets for quick capture (e.g. \"Remember to buy milk\", \"Idea: write a blog post\"). They have an auto-incremented numeric ID and a body string. Use listNotes / createNote. Notes cannot be updated or deleted via tools — only created and listed.",
   "",
   "TOOLS:",
   "- createMainGoal: title (required), description, targetDate (ISO), status (not_started|in_progress|done, required)",
@@ -240,6 +271,8 @@ const BASE_SYSTEM_PROMPT = [
   "- listMainGoals: (no parameters)",
   "- listTargets: status (current|upcoming|recurring, optional)",
   "- listEvents: weekOf (ISO Monday date, optional), weekEnd (ISO Sunday date, optional)",
+  "- listNotes: id (optional, string) — returns a single note by ID, or all notes if omitted",
+  "- createNote: body (required, string) — creates a new note with the given text",
   "",
   "RULES:",
   "- When the current message includes data injected from /goals, /events, /targets, /plan, or /tplan, use that data directly — it is the user's actual data expanded inline. Do not ask the user to retype it.",
@@ -249,7 +282,7 @@ const BASE_SYSTEM_PROMPT = [
   "- Never fabricate, guess, or hallucinate data.",
   "- When a tool returns a result, base your response ONLY on what the tool explicitly returned. Do not assume, extrapolate, or infer data that the tool did not provide. If a tool says 'not found', say exactly that — do not claim other data doesn't exist.",
   "- When executing multiple write operations at once, include ALL tool calls in a single response array. The system supports parallel tool execution.",
-  "- When you mention any main goal, target, or event in your response, ALWAYS include its document ID in brackets like [id: <ID>]. This is critical for follow-up operations.",
+  "- When you mention any main goal, target, event, or note in your response, ALWAYS include its document ID in brackets like [id: <ID>]. This is critical for follow-up operations.",
 ].join("\n");
 
 function formatMainGoal(goal, index) {
@@ -285,6 +318,14 @@ function formatToolResult(toolName, result) {
     const lines = result.items.map((item, i) => `${i + 1}. ${item.title} (${item.date} ${item.startTime}-${item.endTime}) [id: ${item.id}]`);
     return `Events:\n${lines.join("\n")}`;
   }
+  if (toolName === "listNotes") {
+    if (!result.items || result.items.length === 0) return "Notes:\nNone";
+    const lines = result.items.map((item, i) => {
+      const preview = item.body.length > 80 ? item.body.slice(0, 80) + "..." : item.body;
+      return `${i + 1}. ${preview} [id: ${item.id}]`;
+    });
+    return `Notes:\n${lines.join("\n")}`;
+  }
   if (result.id && result.summary) return `${result.summary} [id: ${result.id}]`;
   return null;
 }
@@ -305,24 +346,6 @@ async function fetchMainGoalsForUser(uid) {
   return goals;
 }
 
-async function fetchEventsForWeek(uid, weekOf, weekEnd) {
-  let eventsQuery = db
-      .collection("users")
-      .doc(uid)
-      .collection("events")
-      .where("date", ">=", weekOf);
-  if (weekEnd) {
-    eventsQuery = eventsQuery.where("date", "<=", weekEnd);
-  }
-  const eventsSnap = await eventsQuery.get();
-  const events = [];
-  eventsSnap.forEach((doc) => {
-    events.push({id: doc.id, ...doc.data()});
-  });
-  events.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
-  return events;
-}
-
 async function fetchEventsFromToday(uid) {
   const today = getCurrentDate();
   const eventsSnap = await db
@@ -337,6 +360,17 @@ async function fetchEventsFromToday(uid) {
   });
   events.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
   return events;
+}
+
+async function fetchNotesForUser(uid) {
+  const snap = await db.collection("users").doc(uid).collection("notes").get();
+  const notes = [];
+  snap.forEach((doc) => {
+    if (doc.id === "_meta") return;
+    notes.push({id: doc.id, ...doc.data()});
+  });
+  notes.sort((a, b) => Number(a.id) - Number(b.id));
+  return notes;
 }
 
 async function fetchTargetsForUser(uid, targetStatus) {
@@ -446,22 +480,34 @@ async function expandCommands(uid, text) {
     const sundayDate = new Date(sunday + "T00:00:00");
     const opts = {month: "short", day: "numeric"};
     const label = `${mondayDate.toLocaleDateString("en-US", opts)} – ${sundayDate.toLocaleDateString("en-US", opts)}, ${sundayDate.getFullYear()}`;
-    const events = await fetchEventsForWeek(uid, monday, sunday);
-    const targets = await fetchTargetsForUser(uid);
-    const goals = (await fetchMainGoalsForUser(uid)).filter((g) => g.status !== "done");
+    result = result.replace(/\/week\b/gi, `(WEEK: ${label})`);
+  }
 
-    const sections = [];
-    sections.push(`WEEK OVERVIEW: ${label}`);
-    if (events.length) {
-      sections.push(`\nEVENTS:\n${events.map((e, i) => formatEventLine(e, i)).join("\n")}`);
-    }
-    if (targets.length) {
-      sections.push(`\nTARGETS:\n${targets.map((t, i) => formatTargetLine(t, i)).join("\n")}`);
-    }
-    if (goals.length) {
-      sections.push(`\nMAIN GOALS:\n${goals.map((g, i) => formatMainGoal(g, i)).join("\n")}`);
-    }
-    result = result.replace(/\/week\b/gi, `(${sections.join("\n")})`);
+  // Expand /current
+  if (/\/current\b/i.test(result)) {
+    const targets = await fetchTargetsForUser(uid, "current");
+    const text = targets.length
+      ? targets.map((t, i) => formatTargetLine(t, i)).join("\n")
+      : "No current targets.";
+    result = result.replace(/\/current\b/gi, `(CURRENT TARGETS:\n${text})`);
+  }
+
+  // Expand /upcoming
+  if (/\/upcoming\b/i.test(result)) {
+    const targets = await fetchTargetsForUser(uid, "upcoming");
+    const text = targets.length
+      ? targets.map((t, i) => formatTargetLine(t, i)).join("\n")
+      : "No upcoming targets.";
+    result = result.replace(/\/upcoming\b/gi, `(UPCOMING TARGETS:\n${text})`);
+  }
+
+  // Expand /recurring
+  if (/\/recurring\b/i.test(result)) {
+    const targets = await fetchTargetsForUser(uid, "recurring");
+    const text = targets.length
+      ? targets.map((t, i) => formatTargetLine(t, i)).join("\n")
+      : "No recurring targets.";
+    result = result.replace(/\/recurring\b/gi, `(RECURRING TARGETS:\n${text})`);
   }
 
   return {type: "message", text: result};
@@ -476,6 +522,7 @@ async function handleArchive(uid) {
   const weekStartMs = new Date(weekOf + "T00:00:00").getTime();
   const weekEndMs = new Date(weekEnd + "T00:00:00").getTime();
   let targetsArchived = 0;
+  let targetsSkipped = 0;
   let eventsArchived = 0;
   let goalsArchived = 0;
 
@@ -487,6 +534,10 @@ async function handleArchive(uid) {
 
   for (const tDoc of targetsSnap.docs) {
     const t = tDoc.data();
+    if (t.weekOf && getMondayOf(t.weekOf) >= weekOf) {
+      targetsSkipped++;
+      continue;
+    }
     const goal = t.mainGoalId ? goalsMap[t.mainGoalId] : null;
     await db.collection("archives").add({
       userId: uid,
@@ -503,7 +554,7 @@ async function handleArchive(uid) {
   }
 
   const eventsSnap = await db.collection("users").doc(uid).collection("events")
-      .where("date", "<=", today).get();
+      .where("date", "<", today).get();
   for (const eDoc of eventsSnap.docs) {
     const e = eDoc.data();
     await db.collection("archives").add({
@@ -533,8 +584,10 @@ async function handleArchive(uid) {
     goalsArchived++;
   }
 
+  const skippedNote = targetsSkipped > 0 ? ` ⚠️ Skipped ${targetsSkipped} target(s) still within their week` : "";
+
   return {
-    reply: `📦 Archived: ${targetsArchived} target(s), ${eventsArchived} event(s), ${goalsArchived} goal(s)`,
+    reply: `📦 Archived: ${targetsArchived} target(s), ${eventsArchived} event(s), ${goalsArchived} goal(s)${skippedNote}`,
     model: "archive",
     systemMessage: null,
     steps: [{tool: "ArchiveTargets"}, {tool: "ArchiveEvents"}, {tool: "ArchiveMainGoals"}],
@@ -544,12 +597,20 @@ async function handleArchive(uid) {
 // ── Shared: call LLM with tool-calling loop (up to 5 rounds) ──
 
 async function callLLMWithTools(uid, messages, apiKey) {
+  const sessionId = `ses_schedule-ai-${uid.slice(0, 8)}`;
+  const requestId = `msg_${crypto.randomBytes(16).toString("hex")}`;
+  const opencodeHeaders = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${apiKey}`,
+    "x-opencode-client": "cli",
+    "x-opencode-session": sessionId,
+    "x-opencode-request": requestId,
+    "x-opencode-project": "global",
+    "User-Agent": "opencode/1.17.0",
+  };
   const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
+    headers: opencodeHeaders,
     body: JSON.stringify({
       model: "big-pickle",
       messages,
@@ -623,10 +684,7 @@ async function callLLMWithTools(uid, messages, apiKey) {
 
       const followUpResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
-        },
+        headers: opencodeHeaders,
         body: JSON.stringify(body),
       });
 
@@ -680,10 +738,7 @@ async function callLLMWithTools(uid, messages, apiKey) {
       conversationMessages.push({role: "user", content: "Summarize what you just did for the user in a natural, friendly way."});
       const summaryResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
-        },
+        headers: opencodeHeaders,
         body: JSON.stringify({model: "big-pickle", messages: conversationMessages}),
       });
       if (summaryResponse.ok) {
@@ -987,6 +1042,44 @@ async function handleToolCall(toolCall, uid) {
       };
     }
 
+    // ── Notes ──
+
+    case "listNotes": {
+      if (args.id) {
+        const snap = await db.collection("users").doc(uid).collection("notes").doc(args.id).get();
+        if (!snap.exists) return {toolCallId: id, result: {success: false, error: "Note not found"}};
+        const item = {id: snap.id, ...snap.data()};
+        return {
+          toolCallId: id,
+          result: {success: true, count: 1, items: [item], summary: `Fetched note #${item.id}`},
+        };
+      }
+      const notes = await fetchNotesForUser(uid);
+      return {
+        toolCallId: id,
+        result: {success: true, count: notes.length, items: notes, summary: `Listed ${notes.length} note(s)`},
+      };
+    }
+
+    case "createNote": {
+      const notesRef = db.collection("users").doc(uid).collection("notes");
+      const metaRef = notesRef.doc("_meta");
+      const metaSnap = await metaRef.get();
+      let nextId = 1;
+      if (metaSnap.exists) {
+        nextId = (metaSnap.data().nextIndex || 0) + 1;
+        await metaRef.update({nextIndex: nextId});
+      } else {
+        await metaRef.set({nextIndex: nextId});
+      }
+      const noteRef = notesRef.doc(String(nextId));
+      await noteRef.set({body: args.body, createdAt: FieldValue.serverTimestamp()});
+      return {
+        toolCallId: id,
+        result: {success: true, id: String(nextId), summary: `Created note #${nextId}`},
+      };
+    }
+
     default:
       return {
         toolCallId: id,
@@ -1221,6 +1314,9 @@ exports.telegramWebhook = onRequest(
           "/link <email> — Link your Telegram to Firebase\n" +
           "/today — Show today's date\n" +
           "/week — Show current week date range\n" +
+          "/current — Show current targets\n" +
+          "/upcoming — Show upcoming targets\n" +
+          "/recurring — Show recurring targets\n" +
           "/goals — Show your main goals (paste into chat)\n" +
           "/targets — Show your targets (paste into chat)\n" +
           "/events — Show upcoming events (paste into chat)\n" +
@@ -1248,24 +1344,45 @@ exports.telegramWebhook = onRequest(
           const options = {weekday: "long", month: "short", day: "numeric", year: "numeric"};
           reply = `📆 Today: ${todayDate.toLocaleDateString("en-US", options)}`;
         } else if (/^\/week$/i.test(text)) {
+          const monday = getCurrentWeekMonday();
+          const sunday = getCurrentWeekSunday();
+          const mondayDate = new Date(monday + "T00:00:00");
+          const sundayDate = new Date(sunday + "T00:00:00");
+          const opts = {month: "short", day: "numeric"};
+          const label = `${mondayDate.toLocaleDateString("en-US", opts)} – ${sundayDate.toLocaleDateString("en-US", opts)}, ${sundayDate.getFullYear()}`;
+          reply = `📅 Current week: ${label}`;
+        } else if (/^\/current$/i.test(text)) {
           const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
           if (!userDoc.exists || !userDoc.data().uid) {
             reply = "❌ Link your account first with /link <email>";
           } else {
-            const uid = userDoc.data().uid;
-            const monday = getCurrentWeekMonday();
-            const sunday = getCurrentWeekSunday();
-            const mondayDate = new Date(monday + "T00:00:00");
-            const sundayDate = new Date(sunday + "T00:00:00");
-            const opts = {month: "short", day: "numeric"};
-            const label = `${mondayDate.toLocaleDateString("en-US", opts)} – ${sundayDate.toLocaleDateString("en-US", opts)}, ${sundayDate.getFullYear()}`;
-            const events = await fetchEventsForWeek(uid, monday, sunday);
-            if (events.length === 0) {
-              reply = `📅 Current week: ${label}\n\n🗓️ No events scheduled for this week.`;
-            } else {
-              const lines = events.map((event, index) => formatEventLine(event, index));
-              reply = `📅 Current week: ${label}\n\n🗓️ *This Week's Events:*\n\n${lines.join("\n")}`;
-            }
+            const targets = await fetchTargetsForUser(userDoc.data().uid, "current");
+            const text = targets.length
+              ? targets.map((t, i) => formatTargetLine(t, i)).join("\n")
+              : "No current targets.";
+            reply = `🎯 *Current Targets:*\n\n${text}`;
+          }
+        } else if (/^\/upcoming$/i.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists || !userDoc.data().uid) {
+            reply = "❌ Link your account first with /link <email>";
+          } else {
+            const targets = await fetchTargetsForUser(userDoc.data().uid, "upcoming");
+            const text = targets.length
+              ? targets.map((t, i) => formatTargetLine(t, i)).join("\n")
+              : "No upcoming targets.";
+            reply = `📅 *Upcoming Targets:*\n\n${text}`;
+          }
+        } else if (/^\/recurring$/i.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists || !userDoc.data().uid) {
+            reply = "❌ Link your account first with /link <email>";
+          } else {
+            const targets = await fetchTargetsForUser(userDoc.data().uid, "recurring");
+            const text = targets.length
+              ? targets.map((t, i) => formatTargetLine(t, i)).join("\n")
+              : "No recurring targets.";
+            reply = `🔄 *Recurring Targets:*\n\n${text}`;
           }
 
         // ── Shared commands — delegate to processMessage ──

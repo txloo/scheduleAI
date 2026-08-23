@@ -1,14 +1,14 @@
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import { User } from "firebase/auth";
-import { collection, getDocs, query, where, doc, updateDoc, deleteField } from "firebase/firestore";
-import { signOutUser, db } from "../lib/firebase";
-import { AppView, CalendarEvent, MainGoal, ViewMode, WeekRange } from "../types";
+import { signOutUser } from "../lib/firebase";
+import { AppView, CalendarEvent, MainGoal, WeekRange } from "../types";
 import WeekPicker from "./WeekPicker";
 import EventList, { EventListHandle } from "./EventList";
 import TargetList, { TargetListHandle } from "./TargetList";
 import MainGoalList from "./MainGoalList";
 import TodayEvents from "./TodayEvents";
 import ChatPanel from "./ChatPanel";
+import WeekOverview from "./WeekOverview";
 
 function getWeekRange(date: Date): WeekRange {
   const d = new Date(date);
@@ -32,116 +32,67 @@ function formatDate(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-function getViewFromURL(): ViewMode {
-  const params = new URLSearchParams(window.location.search);
-  const view = params.get("view");
-  if (view === "targets-first" || view === "events-first" || view === "tabbed") {
-    return view;
-  }
-  return "targets-first";
-}
-
-function setViewInURL(mode: ViewMode) {
-  const url = new URL(window.location.href);
-  url.searchParams.set("view", mode);
-  window.history.pushState({}, "", url);
-}
-
 interface DashboardProps {
   user: User;
   onNavigate: (view: AppView) => void;
+  mainGoals: MainGoal[];
+  allEvents: CalendarEvent[];
+  pendingTelegramLinks: { id: string; email: string }[];
+  onFetchMainGoals: () => void;
+  onFetchEvents: () => void;
+  onFetchNotes: () => void;
+  onApproveLink: (linkId: string) => void;
+  onDismissLink: (linkId: string) => void;
 }
 
-export default function Dashboard({ user, onNavigate }: DashboardProps) {
+export default function Dashboard({
+  user,
+  onNavigate,
+  mainGoals,
+  allEvents,
+  pendingTelegramLinks,
+  onFetchMainGoals,
+  onFetchEvents,
+  onFetchNotes,
+  onApproveLink,
+  onDismissLink,
+}: DashboardProps) {
   const [weekRange, setWeekRange] = useState<WeekRange>(() => getWeekRange(new Date()));
-  const [mainGoals, setMainGoals] = useState<MainGoal[]>([]);
-  const [allEvents, setAllEvents] = useState<CalendarEvent[]>([]);
   const [chatOpen, setChatOpen] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>(getViewFromURL);
-  const [activeTab, setActiveTab] = useState<"targets" | "events">("targets");
-  const [pendingTelegramLinks, setPendingTelegramLinks] = useState<{ id: string; email: string }[]>([]);
+  const [overviewOpen, setOverviewOpen] = useState(false);
   const eventListRef = useRef<EventListHandle>(null);
   const targetListRef = useRef<TargetListHandle>(null);
+
+  useEffect(() => {
+    function onPopState() {
+      setChatOpen(false);
+      setOverviewOpen(false);
+    }
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (overviewOpen) {
+        setOverviewOpen(false);
+        return;
+      }
+      if (chatOpen) {
+        setChatOpen(false);
+        return;
+      }
+      if (document.querySelector(".fixed.inset-0.z-50")) return;
+      setChatOpen(true);
+    }
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [chatOpen, overviewOpen]);
 
   const weekOf = formatDate(weekRange.start);
   const weekEnd = formatDate(weekRange.end);
   const today = formatDate(new Date());
-
-  useEffect(() => {
-    fetchMainGoals();
-    fetchEvents();
-    fetchPendingTelegramLinks();
-  }, [user.uid]);
-
-  async function fetchMainGoals() {
-    const snap = await getDocs(collection(db, "users", user.uid, "goals"));
-    const list: MainGoal[] = [];
-    snap.forEach((d) => {
-      const data = d.data() as Omit<MainGoal, "id">;
-      list.push({ id: d.id, ...data });
-    });
-    list.sort((a, b) => {
-      const toMs = (v: unknown): number => {
-        if (!v) return 0;
-        if (v instanceof Date) return v.getTime();
-        if (typeof v === "number") return v;
-        if (typeof v === "string") return new Date(v).getTime() || 0;
-        if (typeof v === "object" && typeof (v as { toDate?: () => Date }).toDate === "function") {
-          return (v as { toDate: () => Date }).toDate().getTime();
-        }
-        return 0;
-      };
-      return toMs(a.createdAt) - toMs(b.createdAt);
-    });
-    setMainGoals(list);
-  }
-
-  async function fetchEvents() {
-    const snap = await getDocs(collection(db, "users", user.uid, "events"));
-    const list: CalendarEvent[] = [];
-    snap.forEach((d) => {
-      const data = d.data() as Omit<CalendarEvent, "id">;
-      list.push({ id: d.id, ...data });
-    });
-    setAllEvents(list);
-  }
-
-  async function fetchPendingTelegramLinks() {
-    try {
-      console.log("[fetchPendingTelegramLinks] querying for email:", user.email);
-      const q = query(
-        collection(db, "telegramUsers"),
-        where("email", "==", user.email),
-        where("pending", "==", true)
-      );
-      const snap = await getDocs(q);
-      console.log("[fetchPendingTelegramLinks] result count:", snap.size);
-      const links: { id: string; email: string }[] = [];
-      snap.forEach((d) => {
-        console.log("[fetchPendingTelegramLinks] found:", d.id, d.data());
-        links.push({ id: d.id, email: d.data().email });
-      });
-      setPendingTelegramLinks(links);
-    } catch (err) {
-      console.error("[fetchPendingTelegramLinks] error:", err);
-    }
-  }
-
-  async function approveLink(linkId: string) {
-    try {
-      await updateDoc(doc(db, "telegramUsers", linkId), {
-        uid: user.uid,
-        pending: deleteField(),
-      });
-      setPendingTelegramLinks((prev) => prev.filter((l) => l.id !== linkId));
-    } catch {
-      alert("Failed to approve link. Please try again.");
-    }
-  }
-
-  function dismissLink(linkId: string) {
-    setPendingTelegramLinks((prev) => prev.filter((l) => l.id !== linkId));
-  }
 
   const todayEvents = useMemo(
     () => allEvents
@@ -162,19 +113,15 @@ export default function Dashboard({ user, onNavigate }: DashboardProps) {
       targetListRef.current?.refresh();
     }
     if (toolNames.some((t) => /Event/i.test(t))) {
-      fetchEvents();
+      onFetchEvents();
     }
     if (toolNames.some((t) => /MainGoal/i.test(t))) {
-      fetchMainGoals();
+      onFetchMainGoals();
     }
-  }, []);
-
-  function cycleViewMode() {
-    const modes: ViewMode[] = ["targets-first", "events-first", "tabbed"];
-    const next = modes[(modes.indexOf(viewMode) + 1) % modes.length];
-    setViewMode(next);
-    setViewInURL(next);
-  }
+    if (toolNames.some((t) => /Note/i.test(t))) {
+      onFetchNotes();
+    }
+  }, [onFetchEvents, onFetchMainGoals, onFetchNotes]);
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
@@ -182,15 +129,6 @@ export default function Dashboard({ user, onNavigate }: DashboardProps) {
         <div className="mx-auto px-4 py-3 flex items-center justify-between">
           <h1 className="text-lg font-bold">Schedule AI</h1>
           <div className="flex items-center gap-3">
-            <button
-              onClick={cycleViewMode}
-              className="text-sm text-gray-600 hover:text-gray-900 transition flex items-center gap-1"
-              title="Toggle view mode"
-            >
-              {viewMode === "targets-first" && "↓ Targets"}
-              {viewMode === "events-first" && "↓ Events"}
-              {viewMode === "tabbed" && "≡ Tabs"}
-            </button>
             <button
               onClick={() => onNavigate("notes")}
               className="text-sm text-gray-600 hover:text-gray-900 transition"
@@ -217,13 +155,13 @@ export default function Dashboard({ user, onNavigate }: DashboardProps) {
               </p>
               <div className="flex gap-2 mt-2">
                 <button
-                  onClick={() => approveLink(pendingTelegramLinks[0].id)}
+                  onClick={() => onApproveLink(pendingTelegramLinks[0].id)}
                   className="bg-green-500 text-white text-sm px-3 py-1 rounded hover:bg-green-600 transition"
                 >
                   Approve
                 </button>
                 <button
-                  onClick={() => dismissLink(pendingTelegramLinks[0].id)}
+                  onClick={() => onDismissLink(pendingTelegramLinks[0].id)}
                   className="bg-gray-400 text-white text-sm px-3 py-1 rounded hover:bg-gray-500 transition"
                 >
                   Dismiss
@@ -231,76 +169,53 @@ export default function Dashboard({ user, onNavigate }: DashboardProps) {
               </div>
             </div>
           )}
-          <TodayEvents userId={user.uid} events={todayEvents} onRefresh={fetchEvents} />
-          <MainGoalList userId={user.uid} mainGoals={mainGoals} onMainGoalsChange={fetchMainGoals} />
+          <TodayEvents userId={user.uid} events={todayEvents} onRefresh={onFetchEvents} />
+          <MainGoalList userId={user.uid} mainGoals={mainGoals} onMainGoalsChange={onFetchMainGoals} />
 
-          {viewMode === "tabbed" ? (
-            <div className="bg-white rounded-lg shadow-sm border p-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Events (right on desktop, below on mobile) */}
+            <div className="order-2 md:order-1 bg-white rounded-lg shadow-sm border p-4">
               <WeekPicker weekRange={weekRange} onChange={setWeekRange} getWeekRange={getWeekRange} />
-              <div className="flex gap-2 mt-4 mb-4 border-b">
-                <button
-                  onClick={() => setActiveTab("targets")}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition ${
-                    activeTab === "targets"
-                      ? "border-blue-600 text-blue-600"
-                      : "border-transparent text-gray-500 hover:text-gray-700"
-                  }`}
-                >
-                  Targets
-                </button>
-                <button
-                  onClick={() => setActiveTab("events")}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition ${
-                    activeTab === "events"
-                      ? "border-blue-600 text-blue-600"
-                      : "border-transparent text-gray-500 hover:text-gray-700"
-                  }`}
-                >
-                  Events
-                </button>
-              </div>
-              <div className={activeTab === "targets" ? "" : "hidden"}>
-                <TargetList ref={targetListRef} userId={user.uid} mainGoals={mainGoals} />
-              </div>
-              <div className={activeTab === "events" ? "" : "hidden"}>
-                <EventList ref={eventListRef} userId={user.uid} events={weekEvents} onRefresh={fetchEvents} />
+              <div className="mt-4">
+                <EventList ref={eventListRef} userId={user.uid} events={weekEvents} onRefresh={onFetchEvents} />
               </div>
             </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* WeekPicker + Events */}
-              <div className={`bg-white rounded-lg shadow-sm border p-4 ${
-                viewMode === "targets-first"
-                  ? "order-2 md:order-1"
-                  : "order-1 md:order-1"
-              }`}>
-                <WeekPicker weekRange={weekRange} onChange={setWeekRange} getWeekRange={getWeekRange} />
-                <div className="mt-4">
-                  <EventList ref={eventListRef} userId={user.uid} events={weekEvents} onRefresh={fetchEvents} />
-                </div>
-              </div>
 
-              {/* Targets */}
-              <div className={`bg-white rounded-lg shadow-sm border p-4 ${
-                viewMode === "targets-first"
-                  ? "order-1 md:order-2"
-                  : "order-2 md:order-2"
-              }`}>
-                <TargetList ref={targetListRef} userId={user.uid} mainGoals={mainGoals} />
-              </div>
+            {/* Targets (left on desktop, above on mobile) */}
+            <div className="order-1 md:order-2 bg-white rounded-lg shadow-sm border p-4">
+              <TargetList ref={targetListRef} userId={user.uid} mainGoals={mainGoals} />
             </div>
-          )}
+          </div>
         </main>
       </div>
 
       <button
-        onClick={() => setChatOpen(!chatOpen)}
+        onClick={() => {
+          setOverviewOpen(false);
+          if (!chatOpen) {
+            history.pushState({ chat: true }, "");
+          }
+          setChatOpen(!chatOpen);
+        }}
         className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-blue-500 text-white rounded-full p-3 shadow-lg hover:bg-blue-600 transition"
       >
         <svg xmlns="http://www.w3.org/2000/svg" className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
         </svg>
       </button>
+
+      <WeekOverview
+        userId={user.uid}
+        allEvents={allEvents}
+        open={overviewOpen}
+        onClose={() => setOverviewOpen(false)}
+        onToggle={() => {
+          if (!overviewOpen) {
+            setChatOpen(false);
+          }
+          setOverviewOpen(!overviewOpen);
+        }}
+      />
 
       <>
         {chatOpen && (

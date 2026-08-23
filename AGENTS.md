@@ -28,9 +28,10 @@ Start: `npm run emulators` (imports `emulator-data` on start; run `npm run emula
 
 ## Architecture Notes
 
-- **LLM integration**: ChatPanel and Telegram `/plan` use OpenCode Zen API (`big-pickle` model) with 12 tool-calling tools (CRUD for goals, targets, events + list operations)
-- **RTDB prompt templates**: Telegram commands fetch configurable `systemPrompt` + `userTemplate` from `prompts/{command}` in Realtime Database
-- **Firestore collections**: `users/{uid}/events`, `users/{uid}/targets`, `users/{uid}/goals`, `archives`, `telegramUsers`
+- **LLM integration**: ChatPanel and Telegram commands use OpenCode Zen API (`big-pickle` model) with 14 tool-calling tools (CRUD for goals, targets, events + list/create notes)
+- **RTDB prompt templates**: Telegram and chat `/plan` / `/tplan` commands fetch configurable `systemPrompt` + `userTemplate` from `prompts/{command}` in Realtime Database
+- **Firestore collections**: `users/{uid}/events`, `users/{uid}/targets`, `users/{uid}/goals`, `users/{uid}/notes`, `archives`, `telegramUsers`
+- **Telegram linking**: `/link <email>` creates a `pending` request; the web app must approve it (sets `uid`) before Telegram commands work
 - **Deployment region**: `asia-southeast1`
 - **Hosting**: SPA rewrite — all routes → `/index.html`
 

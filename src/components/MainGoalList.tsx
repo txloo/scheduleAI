@@ -24,6 +24,7 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
   const [status, setStatus] = useState<MainGoalStatus>("not_started");
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [viewGoal, setViewGoal] = useState<MainGoal | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [editTargetDate, setEditTargetDate] = useState("");
@@ -155,7 +156,10 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
     };
     return (
       <span
-        onClick={onClick}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (onClick) onClick();
+        }}
         className={`inline-block text-xs font-medium px-2 py-0.5 rounded-full ${classes[status]}${onClick ? " cursor-pointer hover:opacity-80" : ""}`}
       >
         {labels[status]}
@@ -177,21 +181,27 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
     return (
       <div
         key={goal.id}
-        onDoubleClick={() => handleStatusCycle(goal)}
-        className={`bg-white border border-l-4 ${goalAccent(displayStatus)} rounded-lg shadow-sm p-3 flex flex-col overflow-hidden select-none min-h-[140px] md:min-w-[240px] md:max-w-[280px] md:h-[280px] md:p-4`}
+        onClick={() => setViewGoal(goal)}
+        className={`bg-white border border-l-4 ${goalAccent(displayStatus)} rounded-lg shadow-sm p-3 flex flex-col overflow-hidden select-none cursor-pointer min-h-[140px] md:min-w-[240px] md:max-w-[280px] md:h-[280px] md:p-4`}
       >
         <div className="flex items-start justify-between mb-2">
           <span className="font-semibold text-sm md:text-base leading-tight">{goal.title}</span>
           <div className="flex items-center gap-0.5 ml-2 shrink-0">
             <button
-              onClick={() => startEdit(goal)}
+              onClick={(e) => {
+                e.stopPropagation();
+                startEdit(goal);
+              }}
               className="text-gray-400 hover:text-gray-700 text-xs px-1"
               title="Edit"
             >
               ✎
             </button>
             <button
-              onClick={() => confirmDelete(goal)}
+              onClick={(e) => {
+                e.stopPropagation();
+                confirmDelete(goal);
+              }}
               className="text-gray-400 hover:text-red-600 text-xs px-1"
               title="Delete"
             >
@@ -251,7 +261,7 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             className="w-full border rounded px-2 py-1 text-sm resize-none"
-            rows={2}
+            rows={5}
           />
           <input
             type="date"
@@ -300,7 +310,7 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
             value={editDescription}
             onChange={(e) => setEditDescription(e.target.value)}
             className="w-full border rounded px-2 py-1 text-sm resize-none"
-            rows={2}
+            rows={10}
             placeholder="Description (optional)"
           />
           <input
@@ -334,6 +344,62 @@ export default function MainGoalList({ userId, mainGoals, onMainGoalsChange }: M
             </button>
           </div>
         </div>
+      </Modal>
+
+      {/* View Goal Modal */}
+      <Modal open={!!viewGoal} onClose={() => setViewGoal(null)} title={viewGoal?.title ?? "Goal"} maxWidth="max-w-3xl">
+        {viewGoal && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <h4 className="text-xl font-semibold">{viewGoal.title}</h4>
+              {statusBadge(viewGoal.status)}
+            </div>
+
+            {viewGoal.targetDate && (
+              <p className="text-sm text-gray-500">
+                Target: <span className="font-medium">{formatDate(viewGoal.targetDate)}</span>
+              </p>
+            )}
+
+            <div>
+              <p className="text-xs font-semibold text-gray-500 uppercase mb-1">Description</p>
+              {viewGoal.description ? (
+                <div className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap break-words text-sm text-gray-700 border rounded-lg p-3 bg-gray-50">
+                  {viewGoal.description}
+                </div>
+              ) : (
+                <p className="text-sm text-gray-400">No description</p>
+              )}
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => {
+                  startEdit(viewGoal);
+                  setViewGoal(null);
+                }}
+                className="flex-1 bg-blue-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-blue-700 transition"
+              >
+                Edit
+              </button>
+              <button
+                onClick={() => {
+                  confirmDelete(viewGoal);
+                  setViewGoal(null);
+                }}
+                className="flex-1 bg-red-600 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-red-700 transition"
+              >
+                Delete
+              </button>
+              <button
+                onClick={() => setViewGoal(null)}
+                className="flex-1 bg-gray-400 text-white rounded px-3 py-1.5 text-sm font-medium hover:bg-gray-500 transition"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        )}
       </Modal>
 
       {/* Delete Confirmation Modal */}
