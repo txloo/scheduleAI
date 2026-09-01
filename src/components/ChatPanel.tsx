@@ -35,7 +35,10 @@ const DEFAULT_MESSAGES: { role: string; content: string }[] = [
   WELCOME_MESSAGE,
 ];
 
+type AiMode = "planner" | "builder";
+
 export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelProps) {
+  const [mode, setMode] = useState<AiMode>("builder");
   const [messages, setMessages] = useState<{ role: string; content: string }[]>(
     DEFAULT_MESSAGES
   );
@@ -108,7 +111,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
 
     try {
       const chatWithLLM = httpsCallable(functions, "chatWithLLM");
-      const result = await chatWithLLM({ text: trimmedInput });
+      const result = await chatWithLLM({ text: trimmedInput, mode });
       const { reply, steps, messages: newMessages } = result.data as { reply: string; model: string; steps?: { tool: string }[]; messages?: { role: string; content: string }[] };
 
       // Use server-returned messages array (includes history + new exchange)
@@ -191,27 +194,46 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
   return (
     <div className="h-full flex flex-col bg-white">
       {/* Header */}
-      <div className="px-4 py-3 border-b flex items-center justify-between">
-        <h3 className="font-bold text-lg">AI Chat</h3>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleTestConnection}
-            className="text-xs bg-green-500 text-white px-2 py-1 rounded hover:bg-green-600"
-          >
-            Test Connection
-          </button>
-          <span className="text-xs text-gray-400">opencode/big-pickle</span>
-          {onClose && (
+      <div className="px-4 py-3 border-b">
+        <div className="flex items-center justify-between">
+          <h3 className="font-bold text-lg">AI Chat</h3>
+          <div className="flex items-center gap-2">
             <button
-              onClick={onClose}
-              className="ml-1 text-gray-400 hover:text-gray-700 transition"
-              title="Close chat"
+              onClick={handleTestConnection}
+              className="text-xs bg-green-500 text-white px-2 py-1 rounded hover:bg-green-600"
             >
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-              </svg>
+              Test Connection
             </button>
-          )}
+            <span className="text-xs text-gray-400">opencode/big-pickle</span>
+            {onClose && (
+              <button
+                onClick={onClose}
+                className="ml-1 text-gray-400 hover:text-gray-700 transition"
+                title="Close chat"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
+        {/* Mode toggle */}
+        <div className="mt-2 flex items-center gap-2">
+          <div className="inline-flex rounded-full border border-gray-300 overflow-hidden text-xs">
+            <button
+              onClick={() => setMode("planner")}
+              className={`px-3 py-1 transition ${mode === "planner" ? "bg-blue-500 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+            >
+              📋 Planner
+            </button>
+            <button
+              onClick={() => setMode("builder")}
+              className={`px-3 py-1 transition ${mode === "builder" ? "bg-blue-500 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+            >
+              🔨 Builder
+            </button>
+          </div>
         </div>
       </div>
 
@@ -301,7 +323,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
           value={input}
           onChange={(e) => { setInput(e.target.value); historyIndex.current = -1; }}
           onKeyDown={handleKeyDown}
-          placeholder="Type your message..."
+          placeholder={mode === "planner" ? "What do you want to plan?" : "What should I create or update?"}
           disabled={loading}
           className="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:opacity-50"
         />

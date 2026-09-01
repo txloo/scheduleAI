@@ -13,7 +13,7 @@ Each has its own `package.json`. Install and run commands separately.
 - **Functions lint**: `npm run lint` (in `functions/` dir — runs before `firebase deploy`)
 - **No frontend tests**: No test script or framework configured in root
 - **TypeScript strict mode**: `noUnusedLocals`, `noUnusedParameters` enforced
-- **Do not run verification (lint/build/tests) unless the user explicitly asks.** The user will report issues themselves.
+- **NEVER run verification (lint/build/tests) on your own**, even if it seems like good practice. The verification is not useful and, if there is an error, it usually sends you into a stuck loop. Only run it if the user explicitly asks. The user will report issues themselves.
 
 ## Firebase Emulators (Local Dev)
 

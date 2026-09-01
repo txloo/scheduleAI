@@ -108,15 +108,14 @@ export default function Notes({ userId, notes, onFetchNotes, onBack }: NotesProp
           {notes.length === 0 ? (
             <p className="text-center text-gray-400 py-8">No notes yet</p>
           ) : (
-            <div className="flex flex-wrap gap-3">
+            <div className="columns-2 md:columns-4 gap-3">
               {notes.map((note) => (
                 <div
                   key={note.id}
                   onClick={() => handleCopy(note.id!, note.body)}
-                  className="bg-white border border-l-4 border-l-blue-400 rounded-lg shadow-sm p-3 flex flex-col overflow-hidden cursor-pointer select-none hover:shadow-md transition min-h-[140px] w-[calc(50%-0.375rem)] md:w-[calc(33.333%-0.5rem)]"
+                  className="bg-white border border-l-4 border-l-blue-400 rounded-lg shadow-sm p-3 flex flex-col break-inside-avoid cursor-pointer select-none hover:shadow-md transition mb-3"
                 >
                   <div className="flex items-start justify-between mb-2">
-                    <span className="text-xs font-mono text-gray-400">#{note.id}</span>
                     <button
                       onClick={(e) => { e.stopPropagation(); confirmDelete(note); }}
                       className="text-red-400 hover:text-red-600 text-xs px-1"
@@ -125,7 +124,7 @@ export default function Notes({ userId, notes, onFetchNotes, onBack }: NotesProp
                       ✕
                     </button>
                   </div>
-                  <p className="text-sm text-gray-800 whitespace-pre-wrap overflow-y-auto">
+                  <p className="text-sm text-gray-800 whitespace-pre-wrap">
                     {note.body}
                   </p>
                   {copiedIdx === note.id && (

@@ -249,7 +249,7 @@ const TOOLS = [
 
 const MAX_TOOL_ROUNDS = 3;
 
-const BASE_SYSTEM_PROMPT = [
+const BUILDER_SYSTEM_PROMPT = [
   "You are Schedule AI's assistant. You manage the user's schedule stored in their database.",
   "You have NO knowledge of the user's data unless it is provided in the current message or you can access it through your tools.",
   "IMPORTANT: You MUST only use the exact tool names and parameter names defined in your tools list. Never invent tool names or parameters.",
@@ -292,6 +292,40 @@ const BASE_SYSTEM_PROMPT = [
   "- When executing multiple write operations at once, include ALL tool calls in a single response array. The system supports parallel tool execution.",
   "- When you mention any main goal, target, event, or note in your response, ALWAYS include its document ID in brackets like [id: <ID>]. This is critical for follow-up operations.",
 ].join("\n");
+
+const PLANNER_SYSTEM_PROMPT = [
+  "You are Schedule AI's planning assistant. Your role is to discuss, advise, and plan with the user about their schedule, main goals, targets, events, and notes.",
+  "You have NO knowledge of the user's data unless it is provided in the current message or you can access it through your read-only tools.",
+  "You are in PLANNER MODE. You CANNOT create, update, or delete anything.",
+  "",
+  "DEFINITIONS:",
+  "- Main Goals: Long-term, aspirational objectives that span weeks or months.",
+  "- Targets: Short-term, actionable tasks for the current week.",
+  "- Events: Fixed calendar appointments with a specific date and time range.",
+  "- Notes: Short text snippets for quick capture.",
+  "",
+  "YOUR TOOLS (read-only ONLY):",
+  "- listMainGoals: (no parameters) — list all the user's main goals.",
+  "- listTargets: status (current|upcoming|recurring, optional) — list the user's targets.",
+  "- listEvents: weekOf (ISO Monday date, optional), weekEnd (ISO Sunday date, optional) — list the user's events.",
+  "- listNotes: id (optional, string) — list the user's notes.",
+  "",
+  "RULES:",
+  "- You may freely discuss, analyze, and help the user plan their week. Use your read tools to inspect their data and give informed advice.",
+  "- You CANNOT create, update, or delete goals, targets, events, or notes. You have NO tools to do so.",
+  "- If the user asks you to create, update, or delete something, DO NOT attempt it. Instead, tell the user what you would do and advise them to switch to Builder mode to execute it.",
+  "- Only use the tools listed above. Do not attempt to call any other tools.",
+  "- Always base your advice on real user data. Use the appropriate read tool before giving specific recommendations.",
+  "- When you mention any main goal, target, event, or note in your response, ALWAYS include its document ID in brackets like [id: <ID>].",
+].join("\n");
+
+// Read-only tools available in Planner mode (reuses definitions from TOOLS)
+const PLANNER_TOOLS = TOOLS.filter((t) =>
+  ["listMainGoals", "listTargets", "listEvents", "listNotes"].includes(t.function.name)
+);
+
+// Hard server-side whitelist for tool calls in Planner mode
+const PLANNER_ALLOWED = new Set(["listMainGoals", "listTargets", "listEvents", "listNotes"]);
 
 function formatMainGoal(goal, index) {
   const statusEmoji = {"not_started": "⬜", "in_progress": "🔵", "done": "✅"};
@@ -625,7 +659,9 @@ async function callZen(headers, body) {
 
 // ── Shared: call LLM with tool-calling loop (up to 3 rounds) ──
 
-async function callLLMWithTools(uid, messages, apiKey) {
+async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
+  const systemPrompt = mode === "planner" ? PLANNER_SYSTEM_PROMPT : BUILDER_SYSTEM_PROMPT;
+  const tools = mode === "planner" ? PLANNER_TOOLS : TOOLS;
   const sessionId = `ses_schedule-ai-${uid.slice(0, 8)}`;
   const requestId = `msg_${crypto.randomBytes(16).toString("hex")}`;
   const opencodeHeaders = {
@@ -643,8 +679,8 @@ async function callLLMWithTools(uid, messages, apiKey) {
   try {
     response = await callZen(opencodeHeaders, {
       model: "big-pickle",
-      messages,
-      tools: TOOLS,
+      messages: [{role: "system", content: systemPrompt}, ...messages],
+      tools,
       tool_choice: "auto",
     });
   } catch (err) {
@@ -676,6 +712,16 @@ async function callLLMWithTools(uid, messages, apiKey) {
     ? choice.tool_calls
     : parseXmlToolCalls(choice?.content || "");
 
+  // Enforce Planner mode: only allow read-only tools. Blocked calls are dropped.
+  if (mode === "planner" && toolCalls.length > 0) {
+    const allowed = toolCalls.filter((tc) => PLANNER_ALLOWED.has(tc.function.name));
+    const blocked = toolCalls.filter((tc) => !PLANNER_ALLOWED.has(tc.function.name));
+    if (blocked.length > 0) {
+      blocked.forEach((tc) => logger.warn(`Tool "${tc.function.name}" blocked in planner mode for user ${uid}`));
+    }
+    toolCalls = allowed;
+  }
+
   // Check if the LLM wants to call tools
   if (toolCalls.length > 0) {
     logger.info(`Executing ${toolCalls.length} tool call(s):`, toolCalls.map((tc) => tc.function.name));
@@ -699,12 +745,13 @@ async function callLLMWithTools(uid, messages, apiKey) {
     }
 
     // Build assistant message with proper tool_calls format
-    const assistantMsg = choice?.tool_calls && choice.tool_calls.length > 0
-      ? {role: "assistant", content: choice.content || null, tool_calls: choice.tool_calls}
+    const assistantMsg = toolCalls.length > 0
+      ? {role: "assistant", content: choice.content || null, tool_calls: toolCalls}
       : {role: "assistant", content: cleanContent || "Let me check that for you."};
 
-    // Initial conversation for follow-up rounds
+    // Initial conversation for follow-up rounds (include system prompt for mode context)
     let conversationMessages = [
+      {role: "system", content: systemPrompt},
       ...messages,
       assistantMsg,
       ...toolResults.map((tr) => ({
@@ -718,7 +765,7 @@ async function callLLMWithTools(uid, messages, apiKey) {
     let finalReply = null;
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       if (Date.now() >= deadline) break;
-      const body = {model: "big-pickle", messages: conversationMessages, tools: TOOLS};
+      const body = {model: "big-pickle", messages: conversationMessages, tools};
 
       let followUpResponse;
       try {
@@ -738,9 +785,19 @@ async function callLLMWithTools(uid, messages, apiKey) {
 
       const data = await followUpResponse.json();
       const msg = data.choices?.[0]?.message;
-      const nextToolCalls = msg?.tool_calls && msg.tool_calls.length > 0
+      let nextToolCalls = msg?.tool_calls && msg.tool_calls.length > 0
         ? msg.tool_calls
         : parseXmlToolCalls(msg?.content || "");
+
+      // Enforce Planner mode on follow-up rounds: only read-only tools allowed
+      if (mode === "planner" && nextToolCalls.length > 0) {
+        const allowed = nextToolCalls.filter((tc) => PLANNER_ALLOWED.has(tc.function.name));
+        const blocked = nextToolCalls.filter((tc) => !PLANNER_ALLOWED.has(tc.function.name));
+        if (blocked.length > 0) {
+          blocked.forEach((tc) => logger.warn(`Tool "${tc.function.name}" blocked in planner mode (follow-up) for user ${uid}`));
+        }
+        nextToolCalls = allowed;
+      }
 
       // No more tool calls — return text response
       if (nextToolCalls.length === 0) {
@@ -754,8 +811,8 @@ async function callLLMWithTools(uid, messages, apiKey) {
       // Execute next round of tool calls
       logger.info(`Round ${round + 2}: executing ${nextToolCalls.length} tool call(s):`, nextToolCalls.map((tc) => tc.function.name));
 
-      const nextAssistantMsg = msg?.tool_calls && msg.tool_calls.length > 0
-        ? {role: "assistant", content: msg.content || null, tool_calls: msg.tool_calls}
+      const nextAssistantMsg = nextToolCalls.length > 0
+        ? {role: "assistant", content: msg.content || null, tool_calls: nextToolCalls}
         : {role: "assistant", content: msg?.content || ""};
 
       conversationMessages = [
@@ -819,7 +876,7 @@ const WELCOME_MESSAGE = {
 // ── Shared: process a user message (core logic for both web and Telegram) ──
 
 async function processMessage(uid, text, options = {}) {
-  const {context = "web"} = options;
+  const {context = "web", mode} = options;
   const chatPath = context === "telegram" ? `chats/telegram/${uid}` : `chats/${uid}`;
   const chatRef = rtdb.ref(chatPath);
 
@@ -831,10 +888,14 @@ async function processMessage(uid, text, options = {}) {
       ? chatData.messages
       : [WELCOME_MESSAGE];
 
+    // Determine mode: explicit option wins; otherwise, Telegram uses RTDB-persisted mode, web defaults to builder
+    let activeMode = mode || chatData?.mode || "builder";
+    if (activeMode !== "planner") activeMode = "builder";
+
     // Handle /clear command
     if (/^\/clear$/i.test(text.trim())) {
-      await chatRef.set({messages: [WELCOME_MESSAGE], updatedAt: Date.now()});
-      return {reply: "Chat history cleared.", model: "opencode/big-pickle", systemMessage: null, messages: [WELCOME_MESSAGE]};
+      await chatRef.set({messages: [WELCOME_MESSAGE], updatedAt: Date.now(), mode: activeMode});
+      return {reply: "Chat history cleared.", model: "opencode/big-pickle", systemMessage: null, messages: [WELCOME_MESSAGE], mode: activeMode};
     }
 
     // Expand commands inline
@@ -856,18 +917,17 @@ async function processMessage(uid, text, options = {}) {
 
     logger.info(`[processMessage] ${context}: user ${uid}, message length ${expanded.text.length}`);
 
-    // Build conversation from history + expanded message
+    // Build conversation from history + expanded message (system prompt injected by callLLMWithTools)
     const historyMessages = messages.filter((m) =>
       m.role !== "system" && m.content !== WELCOME_MESSAGE.content
     );
     const userMsg = {role: "user", content: expanded.text};
     const fullMessages = [
-      {role: "system", content: BASE_SYSTEM_PROMPT},
       ...historyMessages,
       userMsg,
     ];
 
-    const result = await callLLMWithTools(uid, fullMessages, apiKey);
+    const result = await callLLMWithTools(uid, fullMessages, apiKey, activeMode);
 
     // Build updated history: append user + assistant messages
     const updatedHistory = [...historyMessages, userMsg, {role: "assistant", content: result.reply}];
@@ -877,10 +937,13 @@ async function processMessage(uid, text, options = {}) {
       ? [WELCOME_MESSAGE, ...updatedHistory.slice(-30)]
       : [WELCOME_MESSAGE, ...updatedHistory];
 
-    // Persist to RTDB
-    await chatRef.set({messages: finalMessages, updatedAt: Date.now()});
+    // Persist to RTDB (mode only persisted for Telegram context)
+    const saveData = context === "telegram"
+      ? {messages: finalMessages, updatedAt: Date.now(), mode: activeMode}
+      : {messages: finalMessages, updatedAt: Date.now()};
+    await chatRef.set(saveData);
 
-    return {...result, messages: finalMessages};
+    return {...result, messages: finalMessages, mode: activeMode};
   } catch (err) {
     logger.error(`[processMessage] ${context} error for user ${uid}:`, err);
     return {
@@ -1375,6 +1438,7 @@ exports.telegramWebhook = onRequest(
           "/events — Show upcoming events (paste into chat)\n" +
           "/tplan — Generate new targets for this week\n" +
           "/plan — Create a daily schedule\n" +
+          "/mode — Show current mode (/mode planner|builder to switch)\n" +
           "/archive — Archive current targets, past events, completed goals\n" +
           "/clear — Reset chat history";
         } else if (/^\/link\s+/i.test(text)) {
@@ -1440,6 +1504,28 @@ exports.telegramWebhook = onRequest(
 
         // ── Shared commands — delegate to processMessage ──
 
+        } else if (/^\/mode/.test(text)) {
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists || !userDoc.data().uid) {
+            reply = "❌ Link your account first with /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            const tgChatPath = `chats/telegram/${uid}`;
+            const tgChatRef = rtdb.ref(tgChatPath);
+            const tgSnap = await tgChatRef.once("value");
+            const tgData = tgSnap.val();
+            const currentMode = tgData?.mode === "planner" ? "planner" : "builder";
+
+            const modeArg = text.replace(/^\/mode\s*/i, "").trim().toLowerCase();
+            if (!modeArg) {
+              reply = `Current mode: ${currentMode === "planner" ? "📋 Planner" : "🔨 Builder"}\n\nSwitch with /mode planner or /mode builder`;
+            } else if (modeArg === "planner" || modeArg === "builder") {
+              await tgChatRef.update({mode: modeArg, updatedAt: Date.now()});
+              reply = `Switched to ${modeArg === "planner" ? "📋 Planner" : "🔨 Builder"} mode.`;
+            } else {
+              reply = `Unknown mode "${modeArg}". Use /mode planner or /mode builder.`;
+            }
+          }
         } else {
           const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
           if (!userDoc.exists) {
@@ -1476,13 +1562,13 @@ exports.chatWithLLM = onCall(
         return {reply: "Authentication required. Please sign in.", model: "opencode/big-pickle", systemMessage: null, messages: []};
       }
 
-      const {text} = request.data;
+      const {text, mode} = request.data;
       if (!text || typeof text !== "string" || text.trim().length === 0) {
         return {reply: "No message provided.", model: "opencode/big-pickle", systemMessage: null, messages: []};
       }
 
-      logger.info(`chatWithLLM called by user ${uid}`);
-      return await processMessage(uid, text, {context: "web"});
+      logger.info(`chatWithLLM called by user ${uid} (mode: ${mode || "builder"})`);
+      return await processMessage(uid, text, {context: "web", mode});
     },
 );
 
