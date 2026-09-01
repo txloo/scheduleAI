@@ -127,10 +127,13 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
         const toolNames = steps.map((s) => s.tool.split(":")[0].trim());
         onToolAction?.(toolNames);
       }
-    } catch (err) {
+    } catch (err: any) {
+      const errorMessage = err?.code === "functions/deadline-exceeded"
+        ? "The AI took too long to respond. Try a simpler request."
+        : "Sorry, something went wrong. Please try again.";
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "Sorry, something went wrong. Please try again." },
+        { role: "assistant", content: errorMessage },
       ]);
     } finally {
       setLoading(false);

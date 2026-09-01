@@ -247,6 +247,8 @@ const TOOLS = [
   },
 ];
 
+const MAX_TOOL_ROUNDS = 3;
+
 const BASE_SYSTEM_PROMPT = [
   "You are Schedule AI's assistant. You manage the user's schedule stored in their database.",
   "You have NO knowledge of the user's data unless it is provided in the current message or you can access it through your tools.",
@@ -274,6 +276,12 @@ const BASE_SYSTEM_PROMPT = [
   "- listNotes: id (optional, string) — returns a single note by ID, or all notes if omitted",
   "- createNote: body (required, string) — creates a new note with the given text",
   "",
+  "TOOL CALL LIMIT:",
+  `- You have a maximum of ${MAX_TOOL_ROUNDS} tool-calling rounds per message (after your first response). Once they run out, no more tools can be called.`,
+  "- Do not waste rounds: batch ALL related tool calls into a single response array (e.g. every create/update/delete in one go) rather than one action per round.",
+  "- If IDs are unknown, do read/list lookups first, then perform all writes together in your next response.",
+  "- Complete every action the user requested within these rounds; if anything had to be dropped due to the limit, say so explicitly in your final answer.",
+  "",
   "RULES:",
   "- When the current message includes data injected from /goals, /events, /targets, /plan, or /tplan, use that data directly — it is the user's actual data expanded inline. Do not ask the user to retype it.",
   "- For read requests (list, see, get, show): Call the appropriate tool immediately, then summarize results.",
@@ -287,7 +295,9 @@ const BASE_SYSTEM_PROMPT = [
 
 function formatMainGoal(goal, index) {
   const statusEmoji = {"not_started": "⬜", "in_progress": "🔵", "done": "✅"};
-  return `${index + 1}. ${statusEmoji[goal.status] || "❓"} ${goal.title}${goal.targetDate ? ` (due: ${goal.targetDate})` : ""} [id: ${goal.id}]`;
+  let line = `${index + 1}. ${statusEmoji[goal.status] || "❓"} ${goal.title}${goal.targetDate ? ` (due: ${goal.targetDate})` : ""} [id: ${goal.id}]`;
+  if (goal.description) line += `\n${goal.description}`;
+  return line;
 }
 
 function formatEventLine(event, index) {
@@ -302,7 +312,11 @@ function formatTargetLine(target, index) {
 function formatToolResult(toolName, result) {
   if (toolName === "listMainGoals") {
     if (!result.items || result.items.length === 0) return "Main Goals:\nNone";
-    const lines = result.items.map((item, i) => `${i + 1}. ${item.title}${item.targetDate ? ` (due: ${item.targetDate})` : ""} (${item.status}) [id: ${item.id}]`);
+    const lines = result.items.map((item, i) => {
+      let line = `${i + 1}. ${item.title}${item.targetDate ? ` (due: ${item.targetDate})` : ""} (${item.status}) [id: ${item.id}]`;
+      if (item.description) line += `\n${item.description}`;
+      return line;
+    });
     return `Main Goals:\n${lines.join("\n")}`;
   }
   if (toolName === "listTargets") {
@@ -594,7 +608,22 @@ async function handleArchive(uid) {
   };
 }
 
-// ── Shared: call LLM with tool-calling loop (up to 5 rounds) ──
+// ── Shared: single OpenCode Zen API call with hard timeout ──
+
+const ZEN_API_URL = "https://opencode.ai/zen/v1/chat/completions";
+const ZEN_CALL_TIMEOUT_MS = 60000;
+const TOOL_LOOP_BUDGET_MS = 240000;
+
+async function callZen(headers, body) {
+  return fetch(ZEN_API_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(ZEN_CALL_TIMEOUT_MS),
+  });
+}
+
+// ── Shared: call LLM with tool-calling loop (up to 3 rounds) ──
 
 async function callLLMWithTools(uid, messages, apiKey) {
   const sessionId = `ses_schedule-ai-${uid.slice(0, 8)}`;
@@ -608,16 +637,24 @@ async function callLLMWithTools(uid, messages, apiKey) {
     "x-opencode-project": "global",
     "User-Agent": "opencode/1.17.0",
   };
-  const response = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-    method: "POST",
-    headers: opencodeHeaders,
-    body: JSON.stringify({
+  const deadline = Date.now() + TOOL_LOOP_BUDGET_MS;
+
+  let response;
+  try {
+    response = await callZen(opencodeHeaders, {
       model: "big-pickle",
       messages,
       tools: TOOLS,
       tool_choice: "auto",
-    }),
-  });
+    });
+  } catch (err) {
+    logger.error(`OpenCode Zen API request failed:`, err.message || err);
+    return {
+      reply: "Sorry, the AI service could not be reached. Please try again later.",
+      model: "opencode/big-pickle",
+      systemMessage: null,
+    };
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -641,7 +678,7 @@ async function callLLMWithTools(uid, messages, apiKey) {
 
   // Check if the LLM wants to call tools
   if (toolCalls.length > 0) {
-    logger.info(`Executing ${toolCalls.length} tool call(s):`, toolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
+    logger.info(`Executing ${toolCalls.length} tool call(s):`, toolCalls.map((tc) => tc.function.name));
 
     // Execute all tool calls
     const toolResults = [];
@@ -677,16 +714,19 @@ async function callLLMWithTools(uid, messages, apiKey) {
       })),
     ];
 
-    // Multi-step tool loop: up to 5 rounds of tool execution
+    // Multi-step tool loop: up to 3 rounds of tool execution
     let finalReply = null;
-    for (let round = 0; round < 5; round++) {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      if (Date.now() >= deadline) break;
       const body = {model: "big-pickle", messages: conversationMessages, tools: TOOLS};
 
-      const followUpResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-        method: "POST",
-        headers: opencodeHeaders,
-        body: JSON.stringify(body),
-      });
+      let followUpResponse;
+      try {
+        followUpResponse = await callZen(opencodeHeaders, body);
+      } catch (err) {
+        logger.error(`OpenCode Zen API follow-up failed:`, err.message || err);
+        break;
+      }
 
       if (!followUpResponse.ok) {
         const errorText = await followUpResponse.text();
@@ -708,8 +748,11 @@ async function callLLMWithTools(uid, messages, apiKey) {
         break;
       }
 
+      // Stop if the time budget is exhausted — do not start new work
+      if (Date.now() >= deadline) break;
+
       // Execute next round of tool calls
-      logger.info(`Round ${round + 2}: executing ${nextToolCalls.length} tool call(s):`, nextToolCalls.map((tc) => ({tool: tc.function.name, args: JSON.parse(tc.function.arguments)})));
+      logger.info(`Round ${round + 2}: executing ${nextToolCalls.length} tool call(s):`, nextToolCalls.map((tc) => tc.function.name));
 
       const nextAssistantMsg = msg?.tool_calls && msg.tool_calls.length > 0
         ? {role: "assistant", content: msg.content || null, tool_calls: msg.tool_calls}
@@ -735,18 +778,25 @@ async function callLLMWithTools(uid, messages, apiKey) {
 
     // Force a summary response if the loop ended without a text reply
     if (!finalReply) {
-      conversationMessages.push({role: "user", content: "Summarize what you just did for the user in a natural, friendly way."});
-      const summaryResponse = await fetch("https://opencode.ai/zen/v1/chat/completions", {
-        method: "POST",
-        headers: opencodeHeaders,
-        body: JSON.stringify({model: "big-pickle", messages: conversationMessages}),
-      });
-      if (summaryResponse.ok) {
-        const summaryData = await summaryResponse.json();
-        finalReply = summaryData.choices?.[0]?.message?.content || "Actions completed.";
-      } else {
-        const summaries = steps.map((s) => s.tool).join("\n");
-        finalReply = `I've completed the following actions:\n${summaries}`;
+      if (Date.now() < deadline) {
+        conversationMessages.push({role: "user", content: "Summarize what you just did for the user in a natural, friendly way."});
+        try {
+          const summaryResponse = await callZen(opencodeHeaders, {model: "big-pickle", messages: conversationMessages});
+          if (summaryResponse.ok) {
+            const summaryData = await summaryResponse.json();
+            finalReply = summaryData.choices?.[0]?.message?.content || "Actions completed.";
+          }
+        } catch (err) {
+          logger.error(`OpenCode Zen API summary failed:`, err.message || err);
+        }
+      }
+      if (!finalReply) {
+        if (steps.length === 0) {
+          finalReply = "Sorry, I ran out of time before I could do anything. Please try again.";
+        } else {
+          const summaries = steps.map((s) => s.tool).join("\n");
+          finalReply = `I've completed the following actions:\n${summaries}`;
+        }
       }
     }
 
@@ -850,9 +900,9 @@ async function processMessage(uid, text, options = {}) {
  */
 async function handleToolCall(toolCall, uid) {
   const {id, function: {name, arguments: argsJson}} = toolCall;
-  const args = JSON.parse(argsJson);
 
   try {
+    const args = JSON.parse(argsJson);
     switch (name) {
     // ── Create ──
 
@@ -1088,7 +1138,10 @@ async function handleToolCall(toolCall, uid) {
     }
   } catch (err) {
     logger.error(`Tool "${name}" failed for user ${uid}:`, err.message || err);
-    throw err;
+    return {
+      toolCallId: id,
+      result: {success: false, error: err.message || String(err)},
+    };
   }
 }
 
@@ -1214,7 +1267,7 @@ async function fetchUserData(uid, weekOf, targetStatus, weekEnd) {
   const mainGoals = [];
   mainGoalsSnap.forEach((doc) => {
     const d = doc.data();
-    mainGoals.push(`${d.title} (${d.status})`);
+    mainGoals.push(`${d.title} (${d.status})${d.description ? `\n${d.description}` : ""}`);
   });
 
   return {events, targets, mainGoals};
@@ -1272,7 +1325,7 @@ async function sendTelegramMessage(chatId, text, token, parseMode) {
 }
 
 exports.telegramWebhook = onRequest(
-    {maxInstances: 10, region: "asia-southeast1"},
+    {maxInstances: 10, region: "asia-southeast1", timeoutSeconds: 300},
     async (req, res) => {
       if (req.method !== "POST") {
         res.status(405).send("Method Not Allowed");
@@ -1416,7 +1469,7 @@ exports.telegramWebhook = onRequest(
 // ── Callable: chatWithLLM (used by the ChatPanel component) ──
 
 exports.chatWithLLM = onCall(
-    {maxInstances: 10, region: "asia-southeast1"},
+    {maxInstances: 10, region: "asia-southeast1", timeoutSeconds: 300},
     async (request) => {
       const uid = request.auth?.uid;
       if (!uid) {
