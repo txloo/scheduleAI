@@ -58,3 +58,10 @@ To append: read last line, add new line below. To find incomplete items: grep fo
 2026-07-27 ✅ Telegram link approval flow — /link creates a pending request; web dashboard Approve/Dismiss sets uid; telegramUsers Firestore rules added
 2026-07-27 ✅ WeekOverview popup — floating button shows this week's targets + today's events within the next 3 hours
 2026-07-27 ✅ Chat /help command — command list + command chips shown on first open
+2026-09-02 ✅ Per-step LLM bubbles in chat history — each tool-loop round saved as its own assistant message; conversation window expanded welcome + last 50
+2026-09-02 ✅ WeekOverview popup shows weekOf for each target + includes recurring targets; stale non-recurring targets dimmed with "past week" badge
+2026-09-02 ✅ Prompts updated — 16h active window (07:00–23:00, sleep ~23:00–07:00 ±1h) in system prompts + plan/tplan templates; no more heavy-week overload warnings
+2026-09-02 ✅ Prompt/tool updates — target estimatedHours clarified as TOTAL weekly hours; daily schedules include each day's hours directly in the task title
+2026-09-02 ✅ Live RTDB-driven chat with streaming — client renders via onValue listener on chats/{userId}; server streams streaming:true (start + per-step) then streaming:false (final/error); header button contextual (Test Connection when empty / Unblock to clear stuck streaming)
+2026-09-02 ✅ /archive persistence fix — archive exchange now streamed to RTDB (start + 🔧 step bubbles + reply, streaming:false) so the chat never gets stuck and lists refresh; !apiKey path persists an error terminal write too
+2026-09-02 ✅ Newest-to-oldest chat feed — messages render latest at top (oldest pushed down); autoscrolls to top unless the user has scrolled down; scroll float button is now an ↑ arrow that jumps to the newest message

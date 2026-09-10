@@ -48,7 +48,7 @@ const TOOLS = [
         properties: {
           text: {type: "string", description: "Description of the target"},
           priority: {type: "number", description: "Priority level 1-5 (1=lowest, 5=highest)"},
-          estimatedHours: {type: "number", description: "Estimated hours needed"},
+          estimatedHours: {type: "number", description: "Estimated hours in total for the whole week"},
           status: {type: "string", enum: ["current", "upcoming", "recurring"], description: "Status of the target (current, upcoming, or recurring)"},
           mainGoalId: {type: "string", description: "Optional ID of an associated main goal"},
           weekOf: {type: "string", description: "ISO Monday date of the target's week (e.g. 2026-07-28). Used for sort order within same priority. Defaults to current week."},
@@ -104,7 +104,7 @@ const TOOLS = [
           id: {type: "string", description: "ID of the target to update"},
           text: {type: "string", description: "New description"},
           priority: {type: "number", description: "New priority level 1-5"},
-          estimatedHours: {type: "number", description: "New estimated hours"},
+          estimatedHours: {type: "number", description: "New estimated hours (total for the whole week)"},
           status: {type: "string", enum: ["current", "upcoming", "recurring"], description: "New status"},
           mainGoalId: {type: "string", description: "New linked main goal ID (empty string to unlink)"},
           weekOf: {type: "string", description: "New target week (ISO Monday date)"},
@@ -248,6 +248,7 @@ const TOOLS = [
 ];
 
 const MAX_TOOL_ROUNDS = 3;
+const MAX_HISTORY_MESSAGES = 50;
 
 const BUILDER_SYSTEM_PROMPT = [
   "You are Schedule AI's assistant. You manage the user's schedule stored in their database.",
@@ -262,10 +263,10 @@ const BUILDER_SYSTEM_PROMPT = [
   "",
   "TOOLS:",
   "- createMainGoal: title (required), description, targetDate (ISO), status (not_started|in_progress|done, required)",
-  "- createTarget: text (required), priority 1-5 (required), estimatedHours (required), status (current|upcoming|recurring), mainGoalId, weekOf (ISO Monday date for sort order)",
+  "- createTarget: text (required), priority 1-5 (required), estimatedHours (required, TOTAL hours for the whole week), status (current|upcoming|recurring), mainGoalId, weekOf (ISO Monday date for sort order)",
   "- createEvent: title (required), date ISO (required), startTime HH:MM (required), endTime HH:MM (required)",
   "- updateMainGoal: id (required), title, description, targetDate, status (not_started|in_progress|done)",
-  "- updateTarget: id (required), text, priority, estimatedHours, status (current|upcoming|recurring), mainGoalId, weekOf",
+  "- updateTarget: id (required), text, priority, estimatedHours (TOTAL hours for the whole week), status (current|upcoming|recurring), mainGoalId, weekOf",
   "- updateEvent: id (required), title, date, startTime, endTime",
   "- deleteMainGoal: id (required)",
   "- deleteTarget: id (required)",
@@ -281,6 +282,11 @@ const BUILDER_SYSTEM_PROMPT = [
   "- Do not waste rounds: batch ALL related tool calls into a single response array (e.g. every create/update/delete in one go) rather than one action per round.",
   "- If IDs are unknown, do read/list lookups first, then perform all writes together in your next response.",
   "- Complete every action the user requested within these rounds; if anything had to be dropped due to the limit, say so explicitly in your final answer.",
+  "",
+  "USER CONSTRAINTS:",
+  "- The user has 16 active hours per day (roughly 07:00–23:00). Sleep window is roughly 23:00–07:00 (±1 hour).",
+  "- Place tasks/events only within the 16 active hours; treat the sleep window as unavailable.",
+  "- Do not warn about 'heavy weeks' or overloading when the task list is light — schedule naturally what is listed.",
   "",
   "RULES:",
   "- When the current message includes data injected from /goals, /events, /targets, /plan, or /tplan, use that data directly — it is the user's actual data expanded inline. Do not ask the user to retype it.",
@@ -309,6 +315,11 @@ const PLANNER_SYSTEM_PROMPT = [
   "- listTargets: status (current|upcoming|recurring, optional) — list the user's targets.",
   "- listEvents: weekOf (ISO Monday date, optional), weekEnd (ISO Sunday date, optional) — list the user's events.",
   "- listNotes: id (optional, string) — list the user's notes.",
+  "",
+  "USER CONSTRAINTS:",
+  "- The user has 16 active hours per day (roughly 07:00–23:00). Sleep window is roughly 23:00–07:00 (±1 hour).",
+  "- Place tasks/events only within the 16 active hours; treat the sleep window as unavailable.",
+  "- Do not warn about 'heavy weeks' or overloading when the task list is light — advise naturally on what is listed.",
   "",
   "RULES:",
   "- You may freely discuss, analyze, and help the user plan their week. Use your read tools to inspect their data and give informed advice.",
@@ -659,7 +670,31 @@ async function callZen(headers, body) {
 
 // ── Shared: call LLM with tool-calling loop (up to 3 rounds) ──
 
-async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
+function buildStepMessage(content, toolLines) {
+  const lines = [];
+  if (content && content.trim()) lines.push(content.trim());
+  for (const line of toolLines) lines.push(`🔧 ${line}`);
+  return lines.join("\n");
+}
+
+function toolCallLine(toolCall, result) {
+  const summary = result?.summary || result?.error || "Action completed";
+  let args = "";
+  try {
+    if (toolCall?.function?.arguments) {
+      const parsed = JSON.parse(toolCall.function.arguments);
+      const keys = Object.keys(parsed);
+      if (keys.length > 0) {
+        args = ` (${keys.map((k) => `${k}=${parsed[k]}`).join(", ")})`;
+      }
+    }
+  } catch (err) {
+    // Ignore unparsable arguments — show tool name only
+  }
+  return `${toolCall.function.name}${args}: ${summary}`;
+}
+
+async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep = null) {
   const systemPrompt = mode === "planner" ? PLANNER_SYSTEM_PROMPT : BUILDER_SYSTEM_PROMPT;
   const tools = mode === "planner" ? PLANNER_TOOLS : TOOLS;
   const sessionId = `ses_schedule-ai-${uid.slice(0, 8)}`;
@@ -730,10 +765,13 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
     const toolResults = [];
     const steps = [];
     const toolOutputs = [];
+    const stepMessages = [];
+    const initialToolLines = [];
     for (const toolCall of toolCalls) {
       const result = await handleToolCall(toolCall, uid);
       toolResults.push(result);
       steps.push({tool: `${toolCall.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+      initialToolLines.push(toolCallLine(toolCall, result.result));
       const output = formatToolResult(toolCall.function.name, result.result);
       if (output) toolOutputs.push(output);
     }
@@ -743,6 +781,12 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
     if (choice?.tool_calls === undefined || (choice?.tool_calls && choice.tool_calls.length === 0)) {
       cleanContent = cleanContent.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
     }
+
+    // Save the first LLM step response (content + tool calls executed this round)
+    stepMessages.push(buildStepMessage(cleanContent, initialToolLines));
+
+    // Stream the step-so-far to the client (web) via RTDB
+    if (typeof onStep === "function") onStep(stepMessages);
 
     // Build assistant message with proper tool_calls format
     const assistantMsg = toolCalls.length > 0
@@ -780,7 +824,7 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
         logger.error(`OpenCode Zen API follow-up error: ${followUpResponse.status} ${errorText}`);
         const summaries = steps.map((s) => s.tool).join("\n");
         const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
-        return {reply: `${listPrefix}I've completed the following actions:\n${summaries}`, steps, model: "opencode/big-pickle", systemMessage: null};
+        return {reply: `${listPrefix}I've completed the following actions:\n${summaries}`, steps, stepMessages, model: "opencode/big-pickle", systemMessage: null};
       }
 
       const data = await followUpResponse.json();
@@ -820,9 +864,11 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
         nextAssistantMsg,
       ];
 
+      const followToolLines = [];
       for (const tc of nextToolCalls) {
         const result = await handleToolCall(tc, uid);
         steps.push({tool: `${tc.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+        followToolLines.push(toolCallLine(tc, result.result));
         const output = formatToolResult(tc.function.name, result.result);
         if (output) toolOutputs.push(output);
         conversationMessages.push({
@@ -831,6 +877,12 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
           content: JSON.stringify(result.result),
         });
       }
+
+      // Save this follow-up LLM step response (content + tool calls executed this round)
+      stepMessages.push(buildStepMessage(msg?.content || "", followToolLines));
+
+      // Stream the step-so-far to the client (web) via RTDB
+      if (typeof onStep === "function") onStep(stepMessages);
     }
 
     // Force a summary response if the loop ended without a text reply
@@ -858,7 +910,7 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder") {
     }
 
     const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
-    return {reply: `${listPrefix}${finalReply || "Actions completed."}`, steps, model: "opencode/big-pickle", systemMessage: null};
+    return {reply: `${listPrefix}${finalReply || "Actions completed."}`, steps, stepMessages, model: "opencode/big-pickle", systemMessage: null};
   }
 
   // No tool calls — return the LLM's text response
@@ -888,8 +940,8 @@ async function processMessage(uid, text, options = {}) {
       ? chatData.messages
       : [WELCOME_MESSAGE];
 
-    // Determine mode: explicit option wins; otherwise, Telegram uses RTDB-persisted mode, web defaults to builder
-    let activeMode = mode || chatData?.mode || "builder";
+    // Determine mode: explicit option wins; otherwise, Telegram uses RTDB-persisted mode, web defaults to planner
+    let activeMode = mode || chatData?.mode || "planner";
     if (activeMode !== "planner") activeMode = "builder";
 
     // Handle /clear command
@@ -901,10 +953,40 @@ async function processMessage(uid, text, options = {}) {
     // Expand commands inline
     const expanded = await expandCommands(uid, text);
 
+    // Build conversation from history + expanded message (system prompt injected by callLLMWithTools)
+    const historyMessages = messages.filter((m) =>
+      m.role !== "system" && m.content !== WELCOME_MESSAGE.content
+    );
+
     // Handle /archive action
     if (expanded.type === "action" && expanded.action === "archive") {
       logger.info(`[processMessage] ${context}: /archive by ${uid}`);
+      const archiveUserMsg = {role: "user", content: expanded.text};
+      if (context === "web") {
+        await chatRef.set({
+          messages: [WELCOME_MESSAGE, ...historyMessages, archiveUserMsg],
+          updatedAt: Date.now(),
+          streaming: true,
+        });
+      }
       const archiveResult = await handleArchive(uid);
+      if (context === "web") {
+        const stepBubbles = (archiveResult.steps || [])
+          .map((s) => s.tool)
+          .filter((t) => t && t.trim() !== "")
+          .map((tool) => ({role: "assistant", content: `🔧 ${tool}`}));
+        const archiveHistory = [WELCOME_MESSAGE, ...historyMessages, archiveUserMsg, ...stepBubbles, {
+          role: "assistant",
+          content: archiveResult.reply,
+        }];
+        await chatRef.set({
+          messages: archiveHistory.length > MAX_HISTORY_MESSAGES
+            ? [WELCOME_MESSAGE, ...archiveHistory.slice(-MAX_HISTORY_MESSAGES)]
+            : archiveHistory,
+          updatedAt: Date.now(),
+          streaming: false,
+        });
+      }
       return {...archiveResult, messages};
     }
 
@@ -912,40 +994,86 @@ async function processMessage(uid, text, options = {}) {
     const apiKey = process.env.LLM_API_KEY;
     if (!apiKey) {
       logger.error("LLM_API_KEY not configured");
+      if (context === "web") {
+        const apiUserMsg = {role: "user", content: expanded.text};
+        await chatRef.set({
+          messages: [WELCOME_MESSAGE, ...historyMessages, apiUserMsg, {
+            role: "assistant",
+            content: "LLM is not configured.",
+          }],
+          updatedAt: Date.now(),
+          streaming: false,
+        });
+      }
       return {reply: "LLM is not configured.", model: "opencode/big-pickle", systemMessage: null, messages};
     }
 
     logger.info(`[processMessage] ${context}: user ${uid}, message length ${expanded.text.length}`);
 
-    // Build conversation from history + expanded message (system prompt injected by callLLMWithTools)
-    const historyMessages = messages.filter((m) =>
-      m.role !== "system" && m.content !== WELCOME_MESSAGE.content
-    );
     const userMsg = {role: "user", content: expanded.text};
     const fullMessages = [
       ...historyMessages,
       userMsg,
     ];
 
-    const result = await callLLMWithTools(uid, fullMessages, apiKey, activeMode);
+    // Web: stream progress to RTDB (on start + after each step). Telegram keeps a single final write.
+    const writeStream = async (stepMsgs = null) => {
+      if (context !== "web") return;
+      const stepAssistantMessages = (stepMsgs || []).map((c) => ({role: "assistant", content: c}));
+      const inProgress = [WELCOME_MESSAGE, ...historyMessages, userMsg, ...stepAssistantMessages];
+      const trimmed = inProgress.length > MAX_HISTORY_MESSAGES
+        ? [WELCOME_MESSAGE, ...inProgress.slice(-MAX_HISTORY_MESSAGES)]
+        : inProgress;
+      await chatRef.set({messages: trimmed, updatedAt: Date.now(), streaming: true});
+    };
 
-    // Build updated history: append user + assistant messages
-    const updatedHistory = [...historyMessages, userMsg, {role: "assistant", content: result.reply}];
+    // Signal processing has started before the first LLM turn
+    await writeStream();
 
-    // Sliding window: keep welcome message + last 30 entries
-    const finalMessages = updatedHistory.length > 30
-      ? [WELCOME_MESSAGE, ...updatedHistory.slice(-30)]
+    const result = await callLLMWithTools(uid, fullMessages, apiKey, activeMode, writeStream);
+
+    // Build updated history: append user message, each LLM step response, and the final reply
+    const stepAssistantMessages = (result.stepMessages || [])
+      .filter((c) => c && c.trim() !== "")
+      .map((c) => ({role: "assistant", content: c}));
+    const updatedHistory = [
+      ...historyMessages,
+      userMsg,
+      ...stepAssistantMessages,
+      {role: "assistant", content: result.reply},
+    ];
+
+    // Sliding window: keep welcome message + last MAX_HISTORY_MESSAGES entries
+    const finalMessages = updatedHistory.length > MAX_HISTORY_MESSAGES
+      ? [WELCOME_MESSAGE, ...updatedHistory.slice(-MAX_HISTORY_MESSAGES)]
       : [WELCOME_MESSAGE, ...updatedHistory];
 
     // Persist to RTDB (mode only persisted for Telegram context)
     const saveData = context === "telegram"
       ? {messages: finalMessages, updatedAt: Date.now(), mode: activeMode}
-      : {messages: finalMessages, updatedAt: Date.now()};
+      : {messages: finalMessages, updatedAt: Date.now(), streaming: false};
     await chatRef.set(saveData);
 
     return {...result, messages: finalMessages, mode: activeMode};
   } catch (err) {
     logger.error(`[processMessage] ${context} error for user ${uid}:`, err);
+    if (context === "web") {
+      try {
+        const errHistory = [WELCOME_MESSAGE, ...historyMessages, userMsg, {
+          role: "assistant",
+          content: "Sorry, an error occurred while processing your message. Please try again.",
+        }];
+        await chatRef.set({
+          messages: errHistory.length > MAX_HISTORY_MESSAGES
+            ? [WELCOME_MESSAGE, ...errHistory.slice(-MAX_HISTORY_MESSAGES)]
+            : errHistory,
+          updatedAt: Date.now(),
+          streaming: false,
+        });
+      } catch (persistErr) {
+        logger.error(`[processMessage] failed to persist error for user ${uid}:`, persistErr);
+      }
+    }
     return {
       reply: "Sorry, an error occurred. Please try again.",
       model: "opencode/big-pickle",

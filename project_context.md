@@ -18,7 +18,7 @@
 - **WeekPicker** component lets users browse weeks (prev/next/today)
 - Displays current week range (e.g. "Jul 6 – Jul 12, 2026")
 - All data (events, targets) is scoped to the selected week
-- **WeekOverview** popup (floating button next to chat) shows this week's targets and today's events within the next 3 hours
+- **WeekOverview** popup (floating button next to chat) shows this week's targets (current + recurring, plus stale targets flagged "past week"), each with its week, and today's events within the next 3 hours
 
 ### 3. Events Management
 - **EventList** component for CRUD operations on calendar events
@@ -62,16 +62,18 @@
 
 ### 8. AI Chat Assistant
 - **ChatPanel** component provides a floating AI chat interface (fixed bottom-center toggle button + overlay)
-- History is pre-fetched from RTDB on mount; **history is persisted server-side** by the Cloud Function — the client sends text only
-- Calls the `chatWithLLM` Cloud Function via Firebase callable
+- Chat is **driven by a live RTDB listener**: the client subscribes to `chats/{userId}` and renders entirely from the server's `streaming` writes — no waiting on the HTTP response
+- Sends via the `chatWithLLM` Cloud Function (fire-and-forget; the function itself persists to RTDB as it works)
+- **Streaming updates**: server writes `streaming: true` on start and after each tool-loop round (progressive user + step bubbles), and `streaming: false` on the final write (or an error bubble on failure) — client loading state follows that flag
+- Header button is contextual: **Test Connection** when chat is empty (only the welcome message), **⏹ Unblock** once populated (writes `{streaming: false}` to RTDB to clear a stuck run and re-enable input)
 - LLM (OpenCode Zen, `big-pickle` model) has tool-calling capabilities (**14 tools**: CRUD for goals, targets, events + list/create for notes)
-- Tool call steps displayed in chat as assistant messages
+- Prompts assume the user has **16 active hours/day (07:00–23:00)** with sleep roughly 23:00–07:00 (±1h); they schedule only within active hours and avoid heavy-week overload warnings
+- Tool call steps displayed in chat as assistant bubbles — each LLM round in the tool-calling loop (content + tool calls executed) is saved to history as its own message
 - Tool outputs (with IDs) prepended to replies for conversation history context
-- Sliding window: keeps welcome message + last 30 messages
+- Sliding window: keeps welcome message + last 50 messages
 - `/clear` command resets chat history (handled server-side)
 - `/help` command shows all commands (handled client-side); command chips shown on first open
-- **Click-to-copy** bubbles with "Copied!" indicator; scroll-to-bottom button; up/down arrow history navigation
-- "Test Connection" button for verifying emulator connectivity
+- **Click-to-copy** bubbles with "Copied!" indicator; **newest-to-oldest feed** (latest at top, oldest pushed down) with autoscroll-to-top that stops when the user scrolls down; ↑ float button jumps back to the newest message; up/down arrow history navigation
 - `onToolAction` callback refreshes goals, targets, events, and notes lists after AI tool calls
 
 ### 9. Telegram Bot Integration
@@ -148,7 +150,7 @@ users/{uid}/
 archives/{docId}        userId, type (target|event|goal), name, weekStart, weekEnd, goalId?, goalTitle?, archivedAt
 telegramUsers/{fromId}  email, chatId, linkedAt, pending?, uid?
 
-chats (RTDB):           chats/{userId} (web) and chats/telegram/{uid} (Telegram) -> { messages[], updatedAt }
+chats (RTDB):           chats/{userId} (web) and chats/telegram/{uid} (Telegram) -> { messages[], updatedAt, streaming? } (streaming flags client-side progress on web; Telegram uses a single final write)
 prompts (RTDB):         prompts/{command} -> { systemPrompt, userTemplate }
 ```
 
@@ -278,10 +280,10 @@ App (auth gate + centralized data fetch)
     │                              ──> Firestore "users/{uid}/goals" (read for dropdown)
     ├── Chat toggle button        # Fixed bottom-center, toggles chatbox
     ├── WeekOverview button       # Fixed bottom, next to chat toggle (popup with targets + next 3h events)
-    └── ChatPanel (floating)      ──> Cloud Function "chatWithLLM" (text only)
-       (Test Connection btn)         ──> Cloud Function "testConnection"
-                                      ──> RTDB "chats/{userId}" (load on mount; history persisted server-side)
-                                      ──> onToolAction callback (refreshes goals/targets/events/notes after AI tool calls)
+    └── ChatPanel (floating)      ──> Cloud Function "chatWithLLM" (text only, fire-and-forget)
+       (Unblock / Test            ──> Cloud Function "testConnection"
+         Connection btn)              ──> RTDB "chats/{userId}" (live onValue listener; streaming updates drive the UI)
+                                       ──> onToolAction callback (refreshes goals/targets/events/notes after AI tool calls)
 Notes                             # Separate view (reached via header link / back button)
     └── Notes                     ──> Firestore "users/{uid}/notes" (add/delete, click-to-copy)
 
@@ -400,7 +402,7 @@ Client calls with { text } — the client sends TEXT ONLY, not full history
           → Execute each via handleToolCall(toolCall, uid) → writes to users/{uid}/...
           → Send tool results back to LLM for follow-up response
           → Multi-round: up to 5 rounds of tool execution
-      → Append user + assistant messages to history, sliding window (welcome + last 30), persist to RTDB
+      → Append user message, each LLM step response (assistant bubble per round), and final reply to history, sliding window (welcome + last 50), persist to RTDB
   → Return { reply, model, systemMessage, steps, messages }
 ```
 

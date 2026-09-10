@@ -79,8 +79,12 @@ const TargetList = forwardRef<TargetListHandle, TargetListProps>(({ userId, main
       list.push({ id: d.id, ...data });
     });
     list.sort((a, b) => {
-      const aWeek = a.weekOf || getCurrentMonday();
-      const bWeek = b.weekOf || getCurrentMonday();
+      const currentMonday = getCurrentMonday();
+      const aPassed = a.status !== "recurring" && (a.weekOf || currentMonday) < currentMonday;
+      const bPassed = b.status !== "recurring" && (b.weekOf || currentMonday) < currentMonday;
+      if (aPassed !== bPassed) return aPassed ? 1 : -1;
+      const aWeek = a.weekOf || currentMonday;
+      const bWeek = b.weekOf || currentMonday;
       if (aWeek !== bWeek) return aWeek.localeCompare(bWeek);
       return b.priority - a.priority;
     });

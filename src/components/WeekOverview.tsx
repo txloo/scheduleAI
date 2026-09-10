@@ -23,6 +23,12 @@ function getCurrentMonday(): string {
   return `${y}-${m}-${dd}`;
 }
 
+function formatWeekLabel(weekOf?: string): string {
+  if (!weekOf) return "This week";
+  const d = new Date(weekOf + "T00:00:00");
+  return `Week of ${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
+}
+
 export default function WeekOverview({ userId, allEvents, open, onClose, onToggle }: WeekOverviewProps) {
   const [targets, setTargets] = useState<Target[]>([]);
 
@@ -37,11 +43,24 @@ export default function WeekOverview({ userId, allEvents, open, onClose, onToggl
       snap.forEach((d) => {
         const data = d.data() as Omit<Target, "id">;
         const t: Target = { id: d.id, ...data };
-        if (t.status === "current" && (t.weekOf || currentMonday) === currentMonday) {
+        const week = t.weekOf || currentMonday;
+        const isStale = (t.status === "current" || t.status === "upcoming") && week < currentMonday;
+        if (t.status === "recurring" ||
+            (t.status === "current" && week === currentMonday) ||
+            isStale) {
           list.push(t);
         }
       });
-      list.sort((a, b) => b.priority - a.priority);
+      list.sort((a, b) => {
+        const rank = (t: Target): number => {
+          if (t.status !== "recurring" && (t.weekOf || currentMonday) < currentMonday) return 2;
+          if (t.status === "recurring") return 1;
+          return 0;
+        };
+        const diff = rank(a) - rank(b);
+        if (diff !== 0) return diff;
+        return b.priority - a.priority;
+      });
       setTargets(list);
     })();
     return () => {
@@ -53,6 +72,7 @@ export default function WeekOverview({ userId, allEvents, open, onClose, onToggl
   const nowMs = now.getTime();
   const laterMs = nowMs + 3 * 60 * 60 * 1000;
   const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const currentMonday = getCurrentMonday();
 
   const upcomingEvents = allEvents
     .filter((e) => e.date === todayStr)
@@ -91,12 +111,23 @@ export default function WeekOverview({ userId, allEvents, open, onClose, onToggl
               <section>
                 <h4 className="text-xs font-semibold text-gray-500 uppercase mb-1">This Week's Targets</h4>
                 {targets.length > 0 ? (
-                  targets.map((t) => (
-                    <div key={t.id} className="flex justify-between items-start text-sm py-1 border-b last:border-0">
-                      <span className="flex-1">{t.text}</span>
-                      <span className="text-gray-500 ml-2 flex-shrink-0">P{t.priority} · {t.estimatedHours}h</span>
-                    </div>
-                  ))
+                  targets.map((t) => {
+                    const passedWeek = !!(t.status !== "recurring" && (t.weekOf || currentMonday) < currentMonday);
+                    return (
+                      <div key={t.id} className={`flex justify-between items-start text-sm py-1 border-b last:border-0 ${passedWeek ? "opacity-60 text-gray-500" : ""}`}>
+                        <span className="flex-1">
+                          {t.text}
+                          {passedWeek && (
+                            <span className="ml-2 text-xs bg-amber-100 text-amber-700 rounded px-1.5 py-0.5 align-middle">past week</span>
+                          )}
+                        </span>
+                        <span className="ml-2 flex-shrink-0 flex items-center gap-2">
+                          <span className={passedWeek ? "" : "text-gray-500"}>P{t.priority} · {t.estimatedHours}h</span>
+                          <span className="text-xs text-gray-400">{formatWeekLabel(t.weekOf)}</span>
+                        </span>
+                      </div>
+                    );
+                  })
                 ) : (
                   <p className="text-gray-400 text-sm">No targets this week</p>
                 )}

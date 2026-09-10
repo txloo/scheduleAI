@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { httpsCallable } from "firebase/functions";
 import { rtdb, functions } from "../lib/firebase";
-import { ref, get } from "firebase/database";
+import { ref, onValue, update } from "firebase/database";
 
 interface ChatPanelProps {
   userId: string;
@@ -35,10 +35,22 @@ const DEFAULT_MESSAGES: { role: string; content: string }[] = [
   WELCOME_MESSAGE,
 ];
 
+function getToolNamesFromStepBubbles(messages: { role: string; content: string }[]): string[] {
+  const names = new Set<string>();
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    for (const line of String(m.content).split("\n")) {
+      const match = /🔧\s+([A-Za-z0-9_]+)/.exec(line);
+      if (match) names.add(match[1]);
+    }
+  }
+  return [...names];
+}
+
 type AiMode = "planner" | "builder";
 
 export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelProps) {
-  const [mode, setMode] = useState<AiMode>("builder");
+  const [mode, setMode] = useState<AiMode>("planner");
   const [messages, setMessages] = useState<{ role: string; content: string }[]>(
     DEFAULT_MESSAGES
   );
@@ -49,43 +61,49 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const historyIndex = useRef(-1);
+  const prevStreamingRef = useRef<boolean | null>(null);
 
   useEffect(() => {
-    async function fetchMessages() {
-      const chatRef = ref(rtdb, `chats/${userId}`);
-      const snap = await get(chatRef);
-      if (snap.exists()) {
-        const data = snap.val();
-        if (data.messages && Array.isArray(data.messages) && data.messages.length > 0) {
-          setMessages(data.messages);
-        }
+    const chatRef = ref(rtdb, `chats/${userId}`);
+    const unsubscribe = onValue(chatRef, (snap) => {
+      const data = snap.val();
+      const streaming = !!data?.streaming;
+      if (!streaming && prevStreamingRef.current === true && data?.messages) {
+        const toolNames = getToolNamesFromStepBubbles(data.messages);
+        if (toolNames.length > 0) onToolAction?.(toolNames);
       }
-      setLoading(false);
-    }
-    fetchMessages();
+      prevStreamingRef.current = streaming;
+      if (data && data.messages && Array.isArray(data.messages) && data.messages.length > 0) {
+        setMessages(data.messages);
+      } else {
+        setMessages(DEFAULT_MESSAGES);
+      }
+      setLoading(streaming);
+    });
+    return unsubscribe;
   }, [userId]);
 
   const handleScroll = () => {
     const el = messagesContainerRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
-    setShowScrollButton(!nearBottom);
+    const nearTop = el.scrollTop < 100;
+    setShowScrollButton(!nearTop);
   };
 
-  const scrollToBottom = () => {
+  const scrollToTop = () => {
     const el = messagesContainerRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
+    el.scrollTop = 0;
     setShowScrollButton(false);
   };
 
-  // When messages change, scroll to bottom if user was already near bottom
+  // Newest messages render at the top: autoscroll to top on new messages,
+  // but stop if the user has scrolled down reading older ones.
   useEffect(() => {
     const el = messagesContainerRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
-    if (nearBottom) {
-      el.scrollTop = el.scrollHeight;
+    if (el.scrollTop < 100) {
+      el.scrollTop = 0;
       setShowScrollButton(false);
     } else {
       setShowScrollButton(true);
@@ -109,37 +127,24 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
     historyIndex.current = -1;
     setLoading(true);
 
+    // Fire-and-forget: the chat UI updates live via the RTDB listener.
+    // Local loading state follows the server's `streaming` flag in RTDB.
     try {
       const chatWithLLM = httpsCallable(functions, "chatWithLLM");
-      const result = await chatWithLLM({ text: trimmedInput, mode });
-      const { reply, steps, messages: newMessages } = result.data as { reply: string; model: string; steps?: { tool: string }[]; messages?: { role: string; content: string }[] };
+      chatWithLLM({ text: trimmedInput, mode }).catch((err) => {
+        console.error("[chatWithLLM] request failed (UI updates via RTDB):", err);
+      });
+    } catch (err) {
+      console.error("[chatWithLLM] call setup failed:", err);
+    }
+  };
 
-      // Use server-returned messages array (includes history + new exchange)
-      if (newMessages && Array.isArray(newMessages) && newMessages.length > 0) {
-        setMessages(newMessages);
-      } else {
-        // Fallback: append reply locally if server didn't return messages
-        const stepMessages = steps && steps.length > 0
-          ? [{ role: "assistant", content: steps.map((s) => s.tool).join("\n") }]
-          : [];
-        const assistantMessage = { role: "assistant", content: reply };
-        setMessages((prev) => [...prev, ...stepMessages, assistantMessage]);
-      }
-
-      if (steps && steps.length > 0) {
-        const toolNames = steps.map((s) => s.tool.split(":")[0].trim());
-        onToolAction?.(toolNames);
-      }
-    } catch (err: any) {
-      const errorMessage = err?.code === "functions/deadline-exceeded"
-        ? "The AI took too long to respond. Try a simpler request."
-        : "Sorry, something went wrong. Please try again.";
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: errorMessage },
-      ]);
-    } finally {
-      setLoading(false);
+  const handleStopStreaming = async () => {
+    setLoading(false);
+    try {
+      await update(ref(rtdb, `chats/${userId}`), { streaming: false });
+    } catch (err) {
+      console.error("Failed to unblock chat:", err);
     }
   };
 
@@ -198,12 +203,22 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
         <div className="flex items-center justify-between">
           <h3 className="font-bold text-lg">AI Chat</h3>
           <div className="flex items-center gap-2">
-            <button
-              onClick={handleTestConnection}
-              className="text-xs bg-green-500 text-white px-2 py-1 rounded hover:bg-green-600"
-            >
-              Test Connection
-            </button>
+            {messages.length > 1 ? (
+              <button
+                onClick={handleStopStreaming}
+                className="text-xs bg-amber-500 text-white px-2 py-1 rounded hover:bg-amber-600"
+                title="Clears a stuck streaming state so you can send again"
+              >
+                ⏹ Unblock
+              </button>
+            ) : (
+              <button
+                onClick={handleTestConnection}
+                className="text-xs bg-green-500 text-white px-2 py-1 rounded hover:bg-green-600"
+              >
+                Test Connection
+              </button>
+            )}
             <span className="text-xs text-gray-400">opencode/big-pickle</span>
             {onClose && (
               <button
@@ -239,18 +254,29 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
 
       {/* Messages area */}
       <div ref={messagesContainerRef} onScroll={handleScroll} className="relative flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-3">
-        {messages.map((msg, idx) => {
+        {/* Loading indicator (new content streams in at the top) */}
+        {loading && (
+          <div className="flex justify-start">
+            <div className="bg-gray-100 rounded-lg px-3 py-2 text-gray-500 text-sm animate-pulse">
+              thinking...
+            </div>
+          </div>
+        )}
+
+        {/* Newest messages at the top, oldest pushed down */}
+        {[...messages].reverse().map((msg, idx) => {
           if (msg.role === "system") {
             return null;
           }
+          const origIdx = messages.length - 1 - idx;
           const isUser = msg.role === "user";
           return (
             <div
-              key={idx}
+              key={origIdx}
               className={`flex ${isUser ? "justify-end" : "justify-start"}`}
             >
               <div
-                onClick={() => handleCopy(idx, msg.content)}
+                onClick={() => handleCopy(origIdx, msg.content)}
                 className={`max-w-[75%] rounded-lg px-3 py-2 cursor-pointer select-none ${
                   isUser
                     ? "bg-blue-500 text-white"
@@ -258,7 +284,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
                 }`}
               >
                 <div className="whitespace-pre-wrap">{msg.content}</div>
-                {copiedIdx === idx && (
+                {copiedIdx === origIdx && (
                   <div className={`text-xs mt-1 ${isUser ? "text-blue-200" : "text-gray-400"}`}>
                     Copied!
                   </div>
@@ -297,21 +323,12 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
           </div>
         )}
 
-        {/* Loading indicator */}
-        {loading && (
-          <div className="flex justify-start">
-            <div className="bg-gray-100 rounded-lg px-3 py-2 text-gray-500 text-sm animate-pulse">
-              thinking...
-            </div>
-          </div>
-        )}
-
         {showScrollButton && (
           <button
-            onClick={scrollToBottom}
-            className="sticky bottom-0 left-1/2 -translate-x-1/2 bg-gray-800 text-white rounded-full w-8 h-8 flex items-center justify-center shadow-lg hover:bg-gray-700 transition text-sm mx-auto"
+            onClick={scrollToTop}
+            className="sticky top-0 left-1/2 -translate-x-1/2 bg-gray-800 text-white rounded-full w-8 h-8 flex items-center justify-center shadow-lg hover:bg-gray-700 transition text-sm mx-auto"
           >
-            ↓
+            ↑
           </button>
         )}
       </div>
