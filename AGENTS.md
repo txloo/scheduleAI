@@ -24,12 +24,12 @@ Start: `npm run emulators` (imports `emulator-data` on start; run `npm run emula
 ## Environment Variables
 
 - Root `.env`: Vite Firebase config (`VITE_FIREBASE_*` keys)
-- `functions/.env`: `TELEGRAM_BOT_TOKEN`, `LLM_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`
+- `functions/.env`: `TELEGRAM_BOT_TOKEN`, `LLM_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, `LLM_TOOLS` (per-user model override via `/model-<model-id>` chat command)
 - See `.env.example` files in each location
 
 ## Architecture Notes
 
-- **LLM integration**: ChatPanel and Telegram commands use OpenCode Zen API (`big-pickle` model) with 14 tool-calling tools (CRUD for goals, targets, events + list/create notes)
+- **LLM integration**: ChatPanel and Telegram commands use the configured LLM (OpenRouter, model from `LLM_MODEL`, overridable per user via `/model-<model-id>`) with 14 tool-calling tools (CRUD for goals, targets, events + list/create notes). Provider calls are isolated in `functions/openrouter.js`. Tool calling has two modes (`LLM_TOOLS=native|text`, user-set, default native): `native` sends the registered-API `tools` param; `text` is a provider workaround for models without native tool support (OpenRouter `:free`) — it omits the `tools` param, appends a fenced-JSON tool-call protocol to the system prompt at request time only, and parses/executes backend-side. The base prompts are provider-agnostic.
 - **RTDB prompt templates**: Telegram and chat `/plan` / `/tplan` commands fetch configurable `systemPrompt` + `userTemplate` from `prompts/{command}` in Realtime Database
 - **Firestore collections**: `users/{uid}/events`, `users/{uid}/targets`, `users/{uid}/goals`, `users/{uid}/notes`, `archives`, `telegramUsers`
 - **Telegram linking**: `/link <email>` creates a `pending` request; the web app must approve it (sets `uid`) before Telegram commands work

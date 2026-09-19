@@ -66,7 +66,7 @@
 - Sends via the `chatWithLLM` Cloud Function (fire-and-forget; the function itself persists to RTDB as it works)
 - **Streaming updates**: server writes `streaming: true` on start and after each tool-loop round (progressive user + step bubbles), and `streaming: false` on the final write (or an error bubble on failure) — client loading state follows that flag
 - Header button is contextual: **Test Connection** when chat is empty (only the welcome message), **⏹ Unblock** once populated (writes `{streaming: false}` to RTDB to clear a stuck run and re-enable input)
-- LLM (OpenCode Zen, `big-pickle` model) has tool-calling capabilities (**14 tools**: CRUD for goals, targets, events + list/create for notes)
+- LLM (OpenRouter, model from `LLM_MODEL`, overridable per user) has tool-calling capabilities (**14 tools**: CRUD for goals, targets, events + list/create for notes)
 - Prompts assume the user has **16 active hours/day (07:00–23:00)** with sleep roughly 23:00–07:00 (±1h); they schedule only within active hours and avoid heavy-week overload warnings
 - Tool call steps displayed in chat as assistant bubbles — each LLM round in the tool-calling loop (content + tool calls executed) is saved to history as its own message
 - Tool outputs (with IDs) prepended to replies for conversation history context
@@ -166,8 +166,8 @@ prompts (RTDB):         prompts/{command} -> { systemPrompt, userTemplate }
 | `debugGetPromptTemplate` | HTTP | Emulator-only debug endpoint to inspect `prompts/{command}` templates |
 
 ### LLM Integration
-- **Provider**: OpenCode Zen API (`https://opencode.ai/zen/v1/chat/completions`)
-- **Model**: `big-pickle`
+- **Provider**: OpenRouter (`https://openrouter.ai/api/v1/chat/completions`, isolated in `functions/openrouter.js`)
+- **Model**: `z-ai/glm-5.2:free` (via `LLM_MODEL` env; overridable per user with `/model-<model-id>` chat command)
 - **Auth**: Bearer token via `LLM_API_KEY` environment variable
 - **Tool Calling**: 14 tools defined (CRUD for goals, targets, events + list/create for notes)
 - **XML Fallback**: If the model returns tool calls in XML format (`<tool_call>`), they are parsed via `parseXmlToolCalls()` as a fallback
@@ -225,7 +225,8 @@ schedule_AI/
 │       ├── Modal.tsx               # Reusable dialog component (Escape/click-outside to close)
 │       └── TabbedView.tsx          # UNUSED — leftover from the removed view-mode toggle
 ├── functions/                      # Backend (Firebase Cloud Functions, Node.js 24)
-│   ├── index.js                    # ALL cloud functions (single file, ~1459 lines)
+│   ├── index.js                    # ALL cloud functions (single file, ~1750 lines)
+│   ├── openrouter.js               # OpenRouter provider helper (LLM request: URL, headers, timeout)
 │   ├── package.json                # Backend deps (firebase-admin, firebase-functions)
 │   ├── .env                        # Local secrets (gitignored)
 │   ├── .env.example                # Secrets template
@@ -381,7 +382,7 @@ interface Note { id, body }
 
 ### Cloud Functions Architecture (`functions/index.js`)
 
-All functions are defined in a single file (~1459 lines). Key patterns:
+All functions are defined in a single file (~1750 lines). Key patterns:
 
 #### `testConnection` (Callable)
 ```
@@ -397,7 +398,7 @@ Client calls with { text } — the client sends TEXT ONLY, not full history
       → expandCommands(text) — inline expansion of /plan, /tplan, /goals, /events,
         /targets, /week, /current, /upcoming, /recurring (fetch prompt templates + user data)
       → /archive → handleArchive() (archive + delete current targets, past events, done goals)
-      → Send to OpenCode Zen API (big-pickle model) with TOOLS + tool_choice: "auto"
+      → Send to the configured LLM provider (OpenRouter) with TOOLS + tool_choice: "auto"
       → If LLM returns tool_calls (native API format or XML fallback):
           → Execute each via handleToolCall(toolCall, uid) → writes to users/{uid}/...
           → Send tool results back to LLM for follow-up response
@@ -448,12 +449,14 @@ Fourteen OpenAI-compatible function-calling tools:
 | `createNote` | body | `users/{uid}/notes` collection (auto-incremented ID via `_meta`) |
 
 #### Helper Functions
-- `processMessage(uid, text, options)` — Shared core for web + Telegram: history, /clear, command expansion, /archive, LLM call, persistence
+- `processMessage(uid, text, options)` — Shared core for web + Telegram: history, /clear, /model command, command expansion, /archive, LLM call, persistence
 - `expandCommands(uid, text)` — Inline expansion of /plan, /tplan, /goals, /events, /targets, /week, /current, /upcoming, /recurring; returns `/archive` as an action
 - `handleArchive(uid)` — Archives current targets (skipping those still in their week), past events, and done goals; deletes originals
-- `callLLMWithTools(uid, messages, apiKey)` — Calls OpenCode Zen API with tools; multi-round tool execution loop (up to 5 rounds)
+- `callLLM(apiKey, body)` — LLM provider dispatcher (keyed on `LLM_PROVIDER`, default `openrouter`); add a provider module + `LLM_PROVIDERS` entry to support a new one
+- `callLLMWithTools(uid, messages, apiKey, mode, onStep, model)` — Calls the configured LLM provider with tools; multi-round tool execution loop (up to 5 rounds); model defaults to `LLM_MODEL` (per-user override via `/model-<model-id>`)
+- `openRouterChat(apiKey, body)` (in `functions/openrouter.js`) — OpenRouter-only request helper (URL, headers, timeout)
 - `handleToolCall(toolCall, uid)` — Routes LLM tool calls to Firestore operations (writes to `users/{uid}/` subcollections)
-- `parseXmlToolCalls(content)` — Fallback parser for XML-formatted tool calls from big-pickle model
+- `parseXmlToolCalls(content)` — Fallback parser for XML-formatted tool calls from the LLM
 - `formatToolResult(toolName, result)` — Formats tool outputs with IDs for conversation history context
 - `getCurrentWeekMonday()` / `getMondayOf(dateStr)` / `getCurrentWeekSunday()` / `getCurrentDate()` — ISO date helpers
 - `getPromptTemplate(command)` — Fetches prompt template from RTDB `prompts/{command}`
@@ -551,8 +554,8 @@ VITE_FIREBASE_MEASUREMENT_ID
 ```
 TELEGRAM_BOT_TOKEN
 LLM_API_KEY
-LLM_PROVIDER=opencode
-LLM_MODEL=big-pickle
+LLM_PROVIDER=openrouter
+LLM_MODEL=z-ai/glm-5.2:free
 ```
 
 Note: Do NOT set `FIREBASE_PROJECT_ID` in `functions/.env` — the `FIREBASE_` prefix is reserved by the emulator and causes the entire `.env` file to fail to load.
@@ -565,7 +568,7 @@ Note: Do NOT set `FIREBASE_PROJECT_ID` in `functions/.env` — the `FIREBASE_` p
 
 3. **Telegram link approval requires web app** — `/link` creates a `pending` request; the `uid` is only set after manual approval in the web app. Users without web access can't use Telegram commands.
 
-4. **Single-file Cloud Functions** — All backend logic lives in `functions/index.js` (~1459 lines). Consider splitting into separate files as the codebase grows.
+4. **Single-file Cloud Functions** — All backend logic lives in `functions/index.js` (~1750 lines). Consider splitting into separate files as the codebase grows.
 
 5. **No tests** — Neither the frontend nor backend has test files or testing frameworks configured.
 

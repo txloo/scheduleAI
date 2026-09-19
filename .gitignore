@@ -78,3 +78,5 @@ node_modules/
 dist/
 tsconfig.tsbuildinfo
 
+.opencode_data
+.opencode

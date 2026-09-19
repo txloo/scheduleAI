@@ -2,7 +2,7 @@ const {onCall, onRequest} = require("firebase-functions/https");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const {FieldValue} = require("firebase-admin/firestore");
-const crypto = require("crypto");
+const {openRouterChat} = require("./openrouter");
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -330,6 +330,27 @@ const PLANNER_SYSTEM_PROMPT = [
   "- When you mention any main goal, target, event, or note in your response, ALWAYS include its document ID in brackets like [id: <ID>].",
 ].join("\n");
 
+// Provider workaround — NOT part of the base prompts.
+// Some providers/models have no native tool support (e.g. OpenRouter models with the `:free`
+// suffix reject the `tools` parameter with 404 "No endpoints found that support tool use").
+// When the text tool protocol is enabled (LLM_TOOLS=text), this block is appended to the
+// system prompt AT REQUEST TIME ONLY so the model emits tool calls as a fenced JSON block,
+// which we parse and execute backend-side.
+const TEXT_TOOL_PROTOCOL_PROMPT = [
+  "",
+  "TOOL CALL PROTOCOL (OUTPUT FORMAT FOR CALLING TOOLS):",
+  "- When you need to call one or more tools, write your reply text normally, then end with a fenced ```json block. Do not put JSON anywhere else.",
+  "- The block MUST be a JSON array; each element is one tool call: {\"tool\": \"<exact tool name>\", \"arguments\": {<exact parameter names/values as defined in TOOLS>}}.",
+  "- Example:",
+  "```json",
+  "[{\"tool\":\"listTargets\",\"arguments\":{\"status\":\"current\"}}]",
+  "```",
+  "- Batch ALL tool calls into a single array in one block (do not split across messages).",
+  "- If you need IDs, call the relevant list tool first, then issue all writes together in your next response.",
+  "- If no tool call is needed, do NOT include a JSON block.",
+  "- Never invent tool names or parameters; use exactly the tools and parameters defined above.",
+].join("\n");
+
 // Read-only tools available in Planner mode (reuses definitions from TOOLS)
 const PLANNER_TOOLS = TOOLS.filter((t) =>
   ["listMainGoals", "listTargets", "listEvents", "listNotes"].includes(t.function.name)
@@ -653,19 +674,30 @@ async function handleArchive(uid) {
   };
 }
 
-// ── Shared: single OpenCode Zen API call with hard timeout ──
+// ── Shared: LLM provider dispatch (add new provider modules here) ──
 
-const ZEN_API_URL = "https://opencode.ai/zen/v1/chat/completions";
-const ZEN_CALL_TIMEOUT_MS = 60000;
+const DEFAULT_MODEL = process.env.LLM_MODEL || "z-ai/glm-5.2:free";
+const LLM_PROVIDERS = {
+  openrouter: openRouterChat,
+};
+
+// Tool-calling mode (runtime state, toggled per user via /tool; env LLM_TOOLS as fallback):
+//   "native" — send the registered-API `tools` parameter (provider must support it; OpenRouter returns
+//              404 for models that don't, e.g. the `:free` variants).
+//   "text"   — provider workaround: request without `tools`; TEXT_TOOL_PROTOCOL_PROMPT is appended and
+//              tool calls are parsed from a fenced JSON block, executed backend-side.
+// Priority: client-side override (web) or persisted Telegram chat doc > env LLM_TOOLS > default "native".
+function resolveToolMode(override) {
+  if (override === "text" || override === "native") return override;
+  const envSetting = (process.env.LLM_TOOLS || "native").toLowerCase();
+  return envSetting === "text" ? "text" : "native";
+}
 const TOOL_LOOP_BUDGET_MS = 240000;
 
-async function callZen(headers, body) {
-  return fetch(ZEN_API_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(ZEN_CALL_TIMEOUT_MS),
-  });
+async function callLLM(apiKey, body) {
+  const provider = process.env.LLM_PROVIDER || "openrouter";
+  const chat = LLM_PROVIDERS[provider] || openRouterChat;
+  return chat(apiKey, body);
 }
 
 // ── Shared: call LLM with tool-calling loop (up to 3 rounds) ──
@@ -694,45 +726,50 @@ function toolCallLine(toolCall, result) {
   return `${toolCall.function.name}${args}: ${summary}`;
 }
 
-async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep = null) {
-  const systemPrompt = mode === "planner" ? PLANNER_SYSTEM_PROMPT : BUILDER_SYSTEM_PROMPT;
+async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep = null, model = DEFAULT_MODEL, toolModeOverride = null) {
+  const toolMode = resolveToolMode(toolModeOverride);
+  const textTools = toolMode === "text";
+  let systemPrompt = mode === "planner" ? PLANNER_SYSTEM_PROMPT : BUILDER_SYSTEM_PROMPT;
   const tools = mode === "planner" ? PLANNER_TOOLS : TOOLS;
-  const sessionId = `ses_schedule-ai-${uid.slice(0, 8)}`;
-  const requestId = `msg_${crypto.randomBytes(16).toString("hex")}`;
-  const opencodeHeaders = {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${apiKey}`,
-    "x-opencode-client": "cli",
-    "x-opencode-session": sessionId,
-    "x-opencode-request": requestId,
-    "x-opencode-project": "global",
-    "User-Agent": "opencode/1.17.0",
-  };
   const deadline = Date.now() + TOOL_LOOP_BUDGET_MS;
+
+  // Explicitly state the active mode at the top of the latest user message sent to the model.
+  // Only the local array is modified — this is never persisted to chat history.
+  const modeNotice = `Now In *${mode === "planner" ? "Planner" : "Builder"}* mode`;
+  if (messages.length > 0 && messages[messages.length - 1]?.role === "user") {
+    const last = messages[messages.length - 1];
+    messages = [...messages.slice(0, -1), {...last, content: `${modeNotice}\n\n${last.content}`}];
+  }
+
+  if (textTools) {
+    logger.warn(`Text tool protocol ENABLED for model "${model}" (LLM_TOOLS=${process.env.LLM_TOOLS || "native"}): provider has no native tool support`);
+    systemPrompt = systemPrompt + "\n\n" + TEXT_TOOL_PROTOCOL_PROMPT;
+  }
 
   let response;
   try {
-    response = await callZen(opencodeHeaders, {
-      model: "big-pickle",
+    response = await callLLM(apiKey, {
+      model,
       messages: [{role: "system", content: systemPrompt}, ...messages],
-      tools,
-      tool_choice: "auto",
+      ...(textTools ? {} : {tools, tool_choice: "auto"}),
     });
   } catch (err) {
-    logger.error(`OpenCode Zen API request failed:`, err.message || err);
+    logger.error(`LLM request failed:`, err.message || err);
     return {
       reply: "Sorry, the AI service could not be reached. Please try again later.",
-      model: "opencode/big-pickle",
+      error: `LLM request failed: ${err.message || err}`,
+      model: `openrouter/${model}`,
       systemMessage: null,
     };
   }
 
   if (!response.ok) {
     const errorText = await response.text();
-    logger.error(`OpenCode Zen API error: ${response.status} ${errorText}`);
+    logger.error(`LLM API error: ${response.status} ${errorText}`);
     return {
       reply: `Sorry, the AI service returned an error (${response.status}). Please try again later.`,
-      model: "opencode/big-pickle",
+      error: `LLM API error: ${response.status} ${errorText}`,
+      model: `openrouter/${model}`,
       systemMessage: null,
     };
   }
@@ -742,26 +779,36 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep 
 
   logger.info(`LLM response: tool_calls=${JSON.stringify(choice?.tool_calls?.length || 0)}, content_length=${(choice?.content || "").length}, finish_reason=${data.choices?.[0]?.finish_reason}`);
 
-  // Resolve tool calls: prefer native API format, fall back to XML parsing
-  let toolCalls = choice?.tool_calls && choice.tool_calls.length > 0
-    ? choice.tool_calls
-    : parseXmlToolCalls(choice?.content || "");
+  // Resolve tool calls: native API format (registered `tools`) or, when the text tool protocol is
+  // active (provider without native tool support), a fenced-JSON block in the content — with legacy
+  // XML parsing as a final fallback for both modes.
+  let toolCalls = [];
+  if (choice?.tool_calls && choice.tool_calls.length > 0) {
+    toolCalls = choice.tool_calls;
+  } else {
+    const parsed = textTools ? parseTextToolCalls(choice?.content || "") : [];
+    toolCalls = parsed.length > 0 ? parsed : parseXmlToolCalls(choice?.content || "");
+  }
 
   // Enforce Planner mode: only allow read-only tools. Blocked calls are dropped.
+  // Enforce Planner mode: only allow read-only tools. Blocked calls are recorded as ⛔ bubbles
+  // (persisted into history like normal tool steps) and reported back to the model in one message.
+  let blockedTools = [];
   if (mode === "planner" && toolCalls.length > 0) {
     const allowed = toolCalls.filter((tc) => PLANNER_ALLOWED.has(tc.function.name));
-    const blocked = toolCalls.filter((tc) => !PLANNER_ALLOWED.has(tc.function.name));
-    if (blocked.length > 0) {
-      blocked.forEach((tc) => logger.warn(`Tool "${tc.function.name}" blocked in planner mode for user ${uid}`));
-    }
+    blockedTools = toolCalls
+      .filter((tc) => !PLANNER_ALLOWED.has(tc.function.name))
+      .map((tc) => tc.function.name);
+    blockedTools.forEach((name) => logger.warn(`Tool "${name}" blocked in planner mode for user ${uid}`));
     toolCalls = allowed;
   }
 
-  // Check if the LLM wants to call tools
-  if (toolCalls.length > 0) {
+  // Check if the LLM wants to call tools (executing allowed ones, or entering the loop purely to
+  // feed blocked-tool feedback back so the model self-corrects)
+  if (toolCalls.length > 0 || blockedTools.length > 0) {
     logger.info(`Executing ${toolCalls.length} tool call(s):`, toolCalls.map((tc) => tc.function.name));
 
-    // Execute all tool calls
+    // Execute all allowed tool calls
     const toolResults = [];
     const steps = [];
     const toolOutputs = [];
@@ -776,9 +823,17 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep 
       if (output) toolOutputs.push(output);
     }
 
-    // Strip XML tool call blocks from content before follow-up
+    // Record a bubble for each blocked tool, just like an executed tool step
+    for (const name of blockedTools) {
+      steps.push({tool: `${name}: ⛔ blocked (Planner mode)`});
+      initialToolLines.push(`🔧 ${name}: ⛔ blocked (Planner mode)`);
+    }
+
+    // Strip tool-call blocks from content before follow-up: fenced JSON (text mode only) + legacy XML
     let cleanContent = choice?.content || "";
-    if (choice?.tool_calls === undefined || (choice?.tool_calls && choice.tool_calls.length === 0)) {
+    if (textTools) {
+      cleanContent = stripToolBlocks(choice?.content || "");
+    } else if (choice?.tool_calls === undefined || (choice?.tool_calls && choice.tool_calls.length === 0)) {
       cleanContent = cleanContent.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
     }
 
@@ -788,63 +843,109 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep 
     // Stream the step-so-far to the client (web) via RTDB
     if (typeof onStep === "function") onStep(stepMessages);
 
-    // Build assistant message with proper tool_calls format
-    const assistantMsg = toolCalls.length > 0
-      ? {role: "assistant", content: choice.content || null, tool_calls: toolCalls}
-      : {role: "assistant", content: cleanContent || "Let me check that for you."};
+    // Build assistant message + tool results feed-back.
+    // Native mode: assistant message carries `tool_calls` and results come back as `role:"tool"`.
+    // Text mode (no registered `tools`): keep plain text messages — assistant holds the stripped
+    // content, results are fed back as a `user` message (a `role:"tool"` message would be invalid
+    // without a declared `tools` parameter).
+    let conversationMessages;
+    if (textTools) {
+      const resultsText = toolOutputs.length > 0
+        ? `Tool call results:\n${toolOutputs.join("\n\n")}`
+        : "Tools completed.";
+      conversationMessages = [
+        {role: "system", content: systemPrompt},
+        ...messages,
+        {role: "assistant", content: cleanContent || "Let me check that for you."},
+        {role: "user", content: resultsText},
+      ];
+    } else {
+      const assistantMsg = toolCalls.length > 0
+        ? {role: "assistant", content: choice.content || null, tool_calls: toolCalls}
+        : {role: "assistant", content: cleanContent || "Let me check that for you."};
 
-    // Initial conversation for follow-up rounds (include system prompt for mode context)
-    let conversationMessages = [
-      {role: "system", content: systemPrompt},
-      ...messages,
-      assistantMsg,
-      ...toolResults.map((tr) => ({
-        role: "tool",
-        tool_call_id: tr.toolCallId,
-        content: JSON.stringify(tr.result),
-      })),
-    ];
+      // Initial conversation for follow-up rounds (include system prompt for mode context)
+      conversationMessages = [
+        {role: "system", content: systemPrompt},
+        ...messages,
+        assistantMsg,
+        ...toolResults.map((tr) => ({
+          role: "tool",
+          tool_call_id: tr.toolCallId,
+          content: JSON.stringify(tr.result),
+        })),
+      ];
+    }
+
+    // Report blocked Planner tools to the model in a single message so it self-corrects
+    if (blockedTools.length > 0) {
+      conversationMessages.push({
+        role: "user",
+        content: `[Planner mode] Tool(s): "${blockedTools.join("\", \"")}" ${blockedTools.length === 1 ? "was" : "were"} blocked — Planner mode is read-only (listMainGoals, listTargets, listEvents, listNotes only). Do not attempt them again.`,
+      });
+    }
 
     // Multi-step tool loop: up to 3 rounds of tool execution
     let finalReply = null;
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       if (Date.now() >= deadline) break;
-      const body = {model: "big-pickle", messages: conversationMessages, tools};
+      const body = textTools
+        ? {model, messages: conversationMessages}
+        : {model, messages: conversationMessages, tools};
 
       let followUpResponse;
       try {
-        followUpResponse = await callZen(opencodeHeaders, body);
+        followUpResponse = await callLLM(apiKey, body);
       } catch (err) {
-        logger.error(`OpenCode Zen API follow-up failed:`, err.message || err);
+        logger.error(`LLM follow-up failed:`, err.message || err);
         break;
       }
 
       if (!followUpResponse.ok) {
         const errorText = await followUpResponse.text();
-        logger.error(`OpenCode Zen API follow-up error: ${followUpResponse.status} ${errorText}`);
+        logger.error(`LLM follow-up error: ${followUpResponse.status} ${errorText}`);
         const summaries = steps.map((s) => s.tool).join("\n");
         const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
-        return {reply: `${listPrefix}I've completed the following actions:\n${summaries}`, steps, stepMessages, model: "opencode/big-pickle", systemMessage: null};
+        return {reply: `${listPrefix}I've completed the following actions:\n${summaries}`, steps, stepMessages, model: `openrouter/${model}`, systemMessage: null};
       }
 
       const data = await followUpResponse.json();
       const msg = data.choices?.[0]?.message;
-      let nextToolCalls = msg?.tool_calls && msg.tool_calls.length > 0
-        ? msg.tool_calls
-        : parseXmlToolCalls(msg?.content || "");
+      let nextToolCalls = [];
+      if (msg?.tool_calls && msg.tool_calls.length > 0) {
+        nextToolCalls = msg.tool_calls;
+      } else {
+        const parsed = textTools ? parseTextToolCalls(msg?.content || "") : [];
+        nextToolCalls = parsed.length > 0 ? parsed : parseXmlToolCalls(msg?.content || "");
+      }
 
       // Enforce Planner mode on follow-up rounds: only read-only tools allowed
+      let followBlocked = [];
       if (mode === "planner" && nextToolCalls.length > 0) {
         const allowed = nextToolCalls.filter((tc) => PLANNER_ALLOWED.has(tc.function.name));
-        const blocked = nextToolCalls.filter((tc) => !PLANNER_ALLOWED.has(tc.function.name));
-        if (blocked.length > 0) {
-          blocked.forEach((tc) => logger.warn(`Tool "${tc.function.name}" blocked in planner mode (follow-up) for user ${uid}`));
-        }
+        followBlocked = nextToolCalls
+          .filter((tc) => !PLANNER_ALLOWED.has(tc.function.name))
+          .map((tc) => tc.function.name);
+        followBlocked.forEach((name) => logger.warn(`Tool "${name}" blocked in planner mode (follow-up) for user ${uid}`));
         nextToolCalls = allowed;
       }
 
-      // No more tool calls — return text response
+      // Report blocked Planner tools to the model so it self-corrects next round
+      if (followBlocked.length > 0) {
+        for (const name of followBlocked) {
+          steps.push({tool: `${name}: ⛔ blocked (Planner mode)`});
+        }
+        stepMessages.push(buildStepMessage(msg?.content || "", followBlocked.map((name) => `🔧 ${name}: ⛔ blocked (Planner mode)`)));
+        conversationMessages.push({
+          role: "user",
+          content: `[Planner mode] Tool(s): "${followBlocked.join("\", \"")}" ${followBlocked.length === 1 ? "was" : "were"} blocked — Planner mode is read-only (listMainGoals, listTargets, listEvents, listNotes only). Do not attempt them again.`,
+        });
+        if (typeof onStep === "function") onStep(stepMessages);
+      }
+
+      // If only blocked tools were attempted this round, force a correction round
       if (nextToolCalls.length === 0) {
+        if (followBlocked.length > 0) continue;
         finalReply = msg?.content || "Actions completed.";
         break;
       }
@@ -855,31 +956,56 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep 
       // Execute next round of tool calls
       logger.info(`Round ${round + 2}: executing ${nextToolCalls.length} tool call(s):`, nextToolCalls.map((tc) => tc.function.name));
 
-      const nextAssistantMsg = nextToolCalls.length > 0
-        ? {role: "assistant", content: msg.content || null, tool_calls: nextToolCalls}
-        : {role: "assistant", content: msg?.content || ""};
+      if (textTools) {
+        conversationMessages = [
+          ...conversationMessages,
+          {role: "assistant", content: stripToolBlocks(msg?.content || "")},
+        ];
 
-      conversationMessages = [
-        ...conversationMessages,
-        nextAssistantMsg,
-      ];
+        const followToolLines = [];
+        const roundOutputs = [];
+        for (const tc of nextToolCalls) {
+          const result = await handleToolCall(tc, uid);
+          steps.push({tool: `${tc.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+          followToolLines.push(toolCallLine(tc, result.result));
+          const output = formatToolResult(tc.function.name, result.result);
+          if (output) roundOutputs.push(output);
+        }
+        const resultsText = roundOutputs.length > 0
+          ? `Tool call results:\n${roundOutputs.join("\n\n")}`
+          : "Tools completed.";
+        conversationMessages.push({role: "user", content: resultsText});
+        toolOutputs.push(...roundOutputs);
 
-      const followToolLines = [];
-      for (const tc of nextToolCalls) {
-        const result = await handleToolCall(tc, uid);
-        steps.push({tool: `${tc.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
-        followToolLines.push(toolCallLine(tc, result.result));
-        const output = formatToolResult(tc.function.name, result.result);
-        if (output) toolOutputs.push(output);
-        conversationMessages.push({
-          role: "tool",
-          tool_call_id: result.toolCallId,
-          content: JSON.stringify(result.result),
-        });
+        // Save this follow-up LLM step response (content + tool calls executed this round)
+        stepMessages.push(buildStepMessage(stripToolBlocks(msg?.content || ""), followToolLines));
+      } else {
+        const nextAssistantMsg = nextToolCalls.length > 0
+          ? {role: "assistant", content: msg.content || null, tool_calls: nextToolCalls}
+          : {role: "assistant", content: msg?.content || ""};
+
+        conversationMessages = [
+          ...conversationMessages,
+          nextAssistantMsg,
+        ];
+
+        const followToolLines = [];
+        for (const tc of nextToolCalls) {
+          const result = await handleToolCall(tc, uid);
+          steps.push({tool: `${tc.function.name}: ${result.result.summary || result.result.error || "Action completed"}`});
+          followToolLines.push(toolCallLine(tc, result.result));
+          const output = formatToolResult(tc.function.name, result.result);
+          if (output) toolOutputs.push(output);
+          conversationMessages.push({
+            role: "tool",
+            tool_call_id: result.toolCallId,
+            content: JSON.stringify(result.result),
+          });
+        }
+
+        // Save this follow-up LLM step response (content + tool calls executed this round)
+        stepMessages.push(buildStepMessage(msg?.content || "", followToolLines));
       }
-
-      // Save this follow-up LLM step response (content + tool calls executed this round)
-      stepMessages.push(buildStepMessage(msg?.content || "", followToolLines));
 
       // Stream the step-so-far to the client (web) via RTDB
       if (typeof onStep === "function") onStep(stepMessages);
@@ -890,13 +1016,13 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep 
       if (Date.now() < deadline) {
         conversationMessages.push({role: "user", content: "Summarize what you just did for the user in a natural, friendly way."});
         try {
-          const summaryResponse = await callZen(opencodeHeaders, {model: "big-pickle", messages: conversationMessages});
+          const summaryResponse = await callLLM(apiKey, {model, messages: conversationMessages});
           if (summaryResponse.ok) {
             const summaryData = await summaryResponse.json();
             finalReply = summaryData.choices?.[0]?.message?.content || "Actions completed.";
           }
         } catch (err) {
-          logger.error(`OpenCode Zen API summary failed:`, err.message || err);
+          logger.error(`LLM summary failed:`, err.message || err);
         }
       }
       if (!finalReply) {
@@ -910,12 +1036,12 @@ async function callLLMWithTools(uid, messages, apiKey, mode = "builder", onStep 
     }
 
     const listPrefix = toolOutputs.length > 0 ? toolOutputs.join("\n\n") + "\n\n" : "";
-    return {reply: `${listPrefix}${finalReply || "Actions completed."}`, steps, stepMessages, model: "opencode/big-pickle", systemMessage: null};
+    return {reply: `${listPrefix}${finalReply || "Actions completed."}`, steps, stepMessages, model: `openrouter/${model}`, systemMessage: null};
   }
 
   // No tool calls — return the LLM's text response
   const reply = choice?.content || "No response from AI.";
-  return {reply, model: "opencode/big-pickle", systemMessage: null};
+  return {reply, model: `openrouter/${model}`, systemMessage: null};
 }
 
 // ── Shared: welcome message + history constants ──
@@ -928,9 +1054,15 @@ const WELCOME_MESSAGE = {
 // ── Shared: process a user message (core logic for both web and Telegram) ──
 
 async function processMessage(uid, text, options = {}) {
-  const {context = "web", mode} = options;
+  const {context = "web", mode, toolProtocol} = options;
   const chatPath = context === "telegram" ? `chats/telegram/${uid}` : `chats/${uid}`;
   const chatRef = rtdb.ref(chatPath);
+
+  let activeModel = DEFAULT_MODEL;
+  let activeToolMode = null;
+  let historyMessages = [];
+  let persistedHistory = [];
+  let userMsg = {role: "user", content: text};
 
   try {
     // Fetch existing history from RTDB
@@ -944,19 +1076,66 @@ async function processMessage(uid, text, options = {}) {
     let activeMode = mode || chatData?.mode || "planner";
     if (activeMode !== "planner") activeMode = "builder";
 
+    // Current model: user-set value from the chat doc, else env default
+    activeModel = chatData?.model || DEFAULT_MODEL;
+
+    // Current tool protocol: the web client passes it with every message (like mode — client-side toggle);
+    // Telegram has no UI, so it's persisted in the chat doc via the /tool command. Falls back to env/default.
+    activeToolMode = null;
+    if (toolProtocol === "text" || toolProtocol === "native") {
+      activeToolMode = toolProtocol;
+    } else if (context === "telegram" && (chatData?.toolMode === "text" || chatData?.toolMode === "native")) {
+      activeToolMode = chatData.toolMode;
+    }
+
+    // Handle /model command — switches the model without tracking chat history
+    const modelCmd = /^\/model(?:-(.*))?$/i.exec(text.trim());
+    if (modelCmd) {
+      const newModel = modelCmd[1] ? modelCmd[1].trim() : "";
+      if (newModel) {
+        activeModel = newModel;
+        await chatRef.update({model: newModel, updatedAt: Date.now()});
+        return {
+          reply: `Model set to "${newModel}".`,
+          model: `openrouter/${newModel}`,
+          systemMessage: null,
+          messages,
+          mode: activeMode,
+        };
+      }
+      return {
+        reply: `Current model: ${activeModel}\nType /model-<model-id> to switch (e.g. /model-z-ai/glm-5.2:free).`,
+        model: `openrouter/${activeModel}`,
+        systemMessage: null,
+        messages,
+        mode: activeMode,
+      };
+    }
+
     // Handle /clear command
     if (/^\/clear$/i.test(text.trim())) {
-      await chatRef.set({messages: [WELCOME_MESSAGE], updatedAt: Date.now(), mode: activeMode});
-      return {reply: "Chat history cleared.", model: "opencode/big-pickle", systemMessage: null, messages: [WELCOME_MESSAGE], mode: activeMode};
+      await chatRef.set({messages: [WELCOME_MESSAGE], updatedAt: Date.now(), mode: activeMode, model: activeModel, ...(context === "telegram" ? {toolMode: activeToolMode} : {})});
+      return {reply: "Chat history cleared.", model: `openrouter/${activeModel}`, systemMessage: null, messages: [WELCOME_MESSAGE], mode: activeMode};
     }
 
     // Expand commands inline
     const expanded = await expandCommands(uid, text);
 
-    // Build conversation from history + expanded message (system prompt injected by callLLMWithTools)
-    const historyMessages = messages.filter((m) =>
+    // Two derived lists from persisted history:
+    //   persistedHistory — everything except system/welcome; error turns (user msg + "/error" assistant
+    //                      reply) are KEPT here so they stay visible and durable in RTDB.
+    //   historyMessages   — the LLM context window only: error turns are stripped entirely (both the
+    //                      "/error" bubble and its paired user message), so failed turns are never
+    //                      re-sent to the model.
+    const isErrorMsg = (m) => typeof m?.content === "string" && m.content.trim().startsWith("/error");
+    persistedHistory = messages.filter((m) =>
       m.role !== "system" && m.content !== WELCOME_MESSAGE.content
     );
+    historyMessages = persistedHistory.filter((m, i, arr) => {
+      if (isErrorMsg(m)) return false;
+      if (m.role === "user" && isErrorMsg(arr[i + 1])) return false;
+      return true;
+    });
 
     // Handle /archive action
     if (expanded.type === "action" && expanded.action === "archive") {
@@ -964,9 +1143,10 @@ async function processMessage(uid, text, options = {}) {
       const archiveUserMsg = {role: "user", content: expanded.text};
       if (context === "web") {
         await chatRef.set({
-          messages: [WELCOME_MESSAGE, ...historyMessages, archiveUserMsg],
+          messages: [WELCOME_MESSAGE, ...persistedHistory, archiveUserMsg],
           updatedAt: Date.now(),
           streaming: true,
+          model: activeModel,
         });
       }
       const archiveResult = await handleArchive(uid);
@@ -975,7 +1155,7 @@ async function processMessage(uid, text, options = {}) {
           .map((s) => s.tool)
           .filter((t) => t && t.trim() !== "")
           .map((tool) => ({role: "assistant", content: `🔧 ${tool}`}));
-        const archiveHistory = [WELCOME_MESSAGE, ...historyMessages, archiveUserMsg, ...stepBubbles, {
+        const archiveHistory = [WELCOME_MESSAGE, ...persistedHistory, archiveUserMsg, ...stepBubbles, {
           role: "assistant",
           content: archiveResult.reply,
         }];
@@ -985,6 +1165,7 @@ async function processMessage(uid, text, options = {}) {
             : archiveHistory,
           updatedAt: Date.now(),
           streaming: false,
+          model: activeModel,
         });
       }
       return {...archiveResult, messages};
@@ -997,20 +1178,21 @@ async function processMessage(uid, text, options = {}) {
       if (context === "web") {
         const apiUserMsg = {role: "user", content: expanded.text};
         await chatRef.set({
-          messages: [WELCOME_MESSAGE, ...historyMessages, apiUserMsg, {
+          messages: [WELCOME_MESSAGE, ...persistedHistory, apiUserMsg, {
             role: "assistant",
-            content: "LLM is not configured.",
+            content: "/error LLM is not configured.",
           }],
           updatedAt: Date.now(),
           streaming: false,
+          model: activeModel,
         });
       }
-      return {reply: "LLM is not configured.", model: "opencode/big-pickle", systemMessage: null, messages};
+      return {reply: "LLM is not configured.", model: `openrouter/${activeModel}`, systemMessage: null, messages};
     }
 
     logger.info(`[processMessage] ${context}: user ${uid}, message length ${expanded.text.length}`);
 
-    const userMsg = {role: "user", content: expanded.text};
+    userMsg = {role: "user", content: expanded.text};
     const fullMessages = [
       ...historyMessages,
       userMsg,
@@ -1020,27 +1202,28 @@ async function processMessage(uid, text, options = {}) {
     const writeStream = async (stepMsgs = null) => {
       if (context !== "web") return;
       const stepAssistantMessages = (stepMsgs || []).map((c) => ({role: "assistant", content: c}));
-      const inProgress = [WELCOME_MESSAGE, ...historyMessages, userMsg, ...stepAssistantMessages];
+      const inProgress = [WELCOME_MESSAGE, ...persistedHistory, userMsg, ...stepAssistantMessages];
       const trimmed = inProgress.length > MAX_HISTORY_MESSAGES
         ? [WELCOME_MESSAGE, ...inProgress.slice(-MAX_HISTORY_MESSAGES)]
         : inProgress;
-      await chatRef.set({messages: trimmed, updatedAt: Date.now(), streaming: true});
+      await chatRef.set({messages: trimmed, updatedAt: Date.now(), streaming: true, model: activeModel});
     };
 
     // Signal processing has started before the first LLM turn
     await writeStream();
 
-    const result = await callLLMWithTools(uid, fullMessages, apiKey, activeMode, writeStream);
+    const result = await callLLMWithTools(uid, fullMessages, apiKey, activeMode, writeStream, activeModel, activeToolMode);
 
     // Build updated history: append user message, each LLM step response, and the final reply
     const stepAssistantMessages = (result.stepMessages || [])
       .filter((c) => c && c.trim() !== "")
       .map((c) => ({role: "assistant", content: c}));
+    const finalReply = result.error ? "/error " + result.reply : result.reply;
     const updatedHistory = [
-      ...historyMessages,
+      ...persistedHistory,
       userMsg,
       ...stepAssistantMessages,
-      {role: "assistant", content: result.reply},
+      {role: "assistant", content: finalReply},
     ];
 
     // Sliding window: keep welcome message + last MAX_HISTORY_MESSAGES entries
@@ -1048,10 +1231,10 @@ async function processMessage(uid, text, options = {}) {
       ? [WELCOME_MESSAGE, ...updatedHistory.slice(-MAX_HISTORY_MESSAGES)]
       : [WELCOME_MESSAGE, ...updatedHistory];
 
-    // Persist to RTDB (mode only persisted for Telegram context)
+    // Persist to RTDB (mode + toolMode persisted for Telegram; web keeps streaming flag only)
     const saveData = context === "telegram"
-      ? {messages: finalMessages, updatedAt: Date.now(), mode: activeMode}
-      : {messages: finalMessages, updatedAt: Date.now(), streaming: false};
+      ? {messages: finalMessages, updatedAt: Date.now(), mode: activeMode, model: activeModel, toolMode: activeToolMode}
+      : {messages: finalMessages, updatedAt: Date.now(), streaming: false, model: activeModel};
     await chatRef.set(saveData);
 
     return {...result, messages: finalMessages, mode: activeMode};
@@ -1059,9 +1242,9 @@ async function processMessage(uid, text, options = {}) {
     logger.error(`[processMessage] ${context} error for user ${uid}:`, err);
     if (context === "web") {
       try {
-        const errHistory = [WELCOME_MESSAGE, ...historyMessages, userMsg, {
+        const errHistory = [WELCOME_MESSAGE, ...persistedHistory, userMsg, {
           role: "assistant",
-          content: "Sorry, an error occurred while processing your message. Please try again.",
+          content: "/error Sorry, an error occurred while processing your message. Please try again.",
         }];
         await chatRef.set({
           messages: errHistory.length > MAX_HISTORY_MESSAGES
@@ -1069,6 +1252,7 @@ async function processMessage(uid, text, options = {}) {
             : errHistory,
           updatedAt: Date.now(),
           streaming: false,
+          model: activeModel,
         });
       } catch (persistErr) {
         logger.error(`[processMessage] failed to persist error for user ${uid}:`, persistErr);
@@ -1076,7 +1260,7 @@ async function processMessage(uid, text, options = {}) {
     }
     return {
       reply: "Sorry, an error occurred. Please try again.",
-      model: "opencode/big-pickle",
+      model: `openrouter/${activeModel}`,
       systemMessage: null,
       messages: [],
     };
@@ -1336,7 +1520,7 @@ async function handleToolCall(toolCall, uid) {
   }
 }
 
-// ── Helper: parse XML tool calls from big-pickle model response ──
+// ── Helper: parse XML tool calls from LLM model response ──
 
 function parseXmlToolCalls(content) {
   if (!content || !content.includes("<tool_call>")) return [];
@@ -1359,6 +1543,73 @@ function parseXmlToolCalls(content) {
     });
   }
   return calls;
+}
+
+// ── Helper: parse text-protocol tool calls (fenced JSON) ──
+// Used only when the provider/model has no native tool support (see resolveToolMode).
+// The model is instructed (via TEXT_TOOL_PROTOCOL_PROMPT) to end replies with a fenced
+// ```json block containing an array of {tool, arguments} objects. Normalized to the same
+// shape as native tool_calls so handleToolCall / toolCallLine / formatToolResult work unchanged.
+
+function parseTextToolCalls(content) {
+  if (!content) return [];
+
+  // Extract fenced JSON blocks: ```json ... ``` or bare ``` ... ```
+  const blocks = [];
+  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let m;
+  while ((m = fenceRe.exec(content)) !== null) {
+    blocks.push(m[1].trim());
+  }
+  if (blocks.length === 0) {
+    // Fallback: the content may contain a bare top-level JSON array or object
+    const arrMatch = content.match(/\[[\s\S]*\]/);
+    if (arrMatch) blocks.push(arrMatch[0]);
+    else {
+      const objMatch = content.match(/\{[\s\S]*\}/);
+      if (objMatch) blocks.push(objMatch[0]);
+    }
+  }
+
+  const calls = [];
+  let seq = 0;
+  for (const block of blocks) {
+    let parsed;
+    try {
+      parsed = JSON.parse(block);
+    } catch (err) {
+      // Malformed block — skip; other blocks / the XML fallback may still yield calls
+      continue;
+    }
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const name = item.tool || item.name || item.tool_name || null;
+      if (typeof name !== "string" || !name) continue;
+      const argsObj = item.arguments || item.parameters || {};
+      seq += 1;
+      calls.push({
+        id: `txt_${Date.now()}_${seq}`,
+        type: "function",
+        function: {
+          name,
+          arguments: typeof argsObj === "string" ? argsObj : JSON.stringify(argsObj || {}),
+        },
+      });
+    }
+  }
+  return calls;
+}
+
+// ── Helper: strip tool-call blocks from model content before showing it to the user ──
+// Removes fenced JSON blocks (text tool protocol) and legacy <tool_call> XML blocks.
+
+function stripToolBlocks(content) {
+  if (!content) return "";
+  return content
+    .replace(/```(?:json)?\s*[\s\S]*?```/gi, "")
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+    .trim();
 }
 
 // ── Helper: get the ISO date string for the current week's Monday ──
@@ -1567,6 +1818,8 @@ exports.telegramWebhook = onRequest(
           "/tplan — Generate new targets for this week\n" +
           "/plan — Create a daily schedule\n" +
           "/mode — Show current mode (/mode planner|builder to switch)\n" +
+          "/model-<model-id> — Switch AI model (e.g. /model-z-ai/glm-5.2:free)\n" +
+          "/tool — Toggle tool protocol (native vs text)\n" +
           "/archive — Archive current targets, past events, completed goals\n" +
           "/clear — Reset chat history";
         } else if (/^\/link\s+/i.test(text)) {
@@ -1654,6 +1907,40 @@ exports.telegramWebhook = onRequest(
               reply = `Unknown mode "${modeArg}". Use /mode planner or /mode builder.`;
             }
           }
+        } else if (/^\/tool/.test(text)) {
+          // Telegram has no UI toggles, so the tool protocol is set via command (persisted in the chat doc)
+          const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
+          if (!userDoc.exists || !userDoc.data().uid) {
+            reply = "❌ Link your account first with /link <email>";
+          } else {
+            const uid = userDoc.data().uid;
+            const tgChatPath = `chats/telegram/${uid}`;
+            const tgChatRef = rtdb.ref(tgChatPath);
+            const tgSnap = await tgChatRef.once("value");
+            const tgData = tgSnap.val();
+            const storedMode = tgData?.toolMode === "text" || tgData?.toolMode === "native" ? tgData.toolMode : null;
+            const currentMode = resolveToolMode(storedMode);
+
+            const toolArg = text.replace(/^\/tool\s*/i, "").trim().toLowerCase();
+            if (!toolArg || toolArg === "toggle" || toolArg === "switch") {
+              const next = currentMode === "text" ? "native" : "text";
+              await tgChatRef.update({toolMode: next, updatedAt: Date.now()});
+              reply = `Tool protocol toggled to "${next}".\nCurrent: ${next} ${next === "text"
+                ? "(provider workaround — native tools param omitted; model emits fenced-JSON tool calls parsed + executed backend-side)"
+                : "(registered-API tools + tool_choice: auto; executed backend-side)"}`;
+            } else if (toolArg === "on" || toolArg === "text") {
+              await tgChatRef.update({toolMode: "text", updatedAt: Date.now()});
+              reply = "Tool protocol set to \"text\" (provider workaround for models without native tool support).";
+            } else if (toolArg === "off" || toolArg === "native") {
+              await tgChatRef.update({toolMode: "native", updatedAt: Date.now()});
+              reply = "Tool protocol set to \"native\" (registered-API tools).";
+            } else if (toolArg === "reset") {
+              await tgChatRef.update({toolMode: null, updatedAt: Date.now()});
+              reply = "Tool protocol reset to the server default.";
+            } else {
+              reply = "Unknown argument. Usage: /tool (toggle), /tool on|text, /tool off|native, /tool reset.";
+            }
+          }
         } else {
           const userDoc = await db.collection("telegramUsers").doc(String(fromId)).get();
           if (!userDoc.exists) {
@@ -1687,16 +1974,16 @@ exports.chatWithLLM = onCall(
     async (request) => {
       const uid = request.auth?.uid;
       if (!uid) {
-        return {reply: "Authentication required. Please sign in.", model: "opencode/big-pickle", systemMessage: null, messages: []};
+        return {reply: "Authentication required. Please sign in.", model: `openrouter/${DEFAULT_MODEL}`, systemMessage: null, messages: []};
       }
 
-      const {text, mode} = request.data;
+      const {text, mode, toolProtocol} = request.data;
       if (!text || typeof text !== "string" || text.trim().length === 0) {
-        return {reply: "No message provided.", model: "opencode/big-pickle", systemMessage: null, messages: []};
+        return {reply: "No message provided.", model: `openrouter/${DEFAULT_MODEL}`, systemMessage: null, messages: []};
       }
 
-      logger.info(`chatWithLLM called by user ${uid} (mode: ${mode || "builder"})`);
-      return await processMessage(uid, text, {context: "web", mode});
+      logger.info(`chatWithLLM called by user ${uid} (mode: ${mode || "builder"}, toolProtocol: ${toolProtocol || "default"})`);
+      return await processMessage(uid, text, {context: "web", mode, toolProtocol});
     },
 );
 

@@ -25,6 +25,9 @@ const COMMANDS = [
   { command: "/targets", description: "Show your current targets" },
   { command: "/events", description: "Show upcoming events" },
   { command: "/archive", description: "Archive current targets, past events, completed goals" },
+  { command: "/model-<model-id>", description: "Switch AI model (e.g. /model-z-ai/glm-5.2:free)" },
+  { command: "/tool", description: "Toggle tool protocol (native vs text)" },
+  { command: "/settings", description: "Show current model and mode" },
   { command: "/help", description: "Show all available commands" },
   { command: "/clear", description: "Reset chat history" },
 ];
@@ -48,9 +51,14 @@ function getToolNamesFromStepBubbles(messages: { role: string; content: string }
 }
 
 type AiMode = "planner" | "builder";
+type AiToolMode = "native" | "text";
+
+const DEFAULT_LABEL = "openrouter/z-ai/glm-5.2:free";
 
 export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelProps) {
   const [mode, setMode] = useState<AiMode>("planner");
+  const [toolProtocol, setToolProtocol] = useState<AiToolMode>("text");
+  const [activeModel, setActiveModel] = useState<string>(DEFAULT_LABEL);
   const [messages, setMessages] = useState<{ role: string; content: string }[]>(
     DEFAULT_MESSAGES
   );
@@ -78,6 +86,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
       } else {
         setMessages(DEFAULT_MESSAGES);
       }
+      if (data?.model) setActiveModel(`openrouter/${data.model}`);
       setLoading(streaming);
     });
     return unsubscribe;
@@ -120,6 +129,47 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
       return;
     }
 
+    const modelCmd = /^\/model(?:-(.*))?$/i.exec(trimmedInput);
+    if (modelCmd) {
+      setInput("");
+      historyIndex.current = -1;
+      const newModel = modelCmd[1] ? modelCmd[1].trim() : "";
+      setTransientMessage(
+        newModel
+          ? `Model set to "${newModel}".`
+          : `Current model: ${activeModel}. Type /model-<model-id> to switch.`
+      );
+      try {
+        const chatWithLLM = httpsCallable(functions, "chatWithLLM");
+        chatWithLLM({ text: trimmedInput, mode, toolProtocol }).catch((err) => {
+          console.error("[chatWithLLM] model switch failed (UI updates via RTDB):", err);
+        });
+      } catch (err) {
+        console.error("[chatWithLLM] model switch setup failed:", err);
+      }
+      return;
+    }
+
+    if (/^\/tool$/i.test(trimmedInput)) {
+      setInput("");
+      const next = toolProtocol === "text" ? "native" : "text";
+      setToolProtocol(next);
+      setTransientMessage(
+        `Tool protocol switched to "${next}".\n\n${next === "text"
+          ? "Provider workaround: native tools param is omitted; the model emits a fenced-JSON tool-call block that is parsed + executed backend-side."
+          : "Native: registered-API tools + tool_choice: auto; tool calls are executed backend-side."}`
+      );
+      return;
+    }
+
+    if (/^\/settings$/i.test(trimmedInput)) {
+      setInput("");
+      setTransientMessage(
+        `Settings\n• AI model: ${activeModel}\n• Chat mode: ${mode === "planner" ? "📋 Planner" : "🔨 Builder"}`
+      );
+      return;
+    }
+
     const userMessage = { role: "user", content: trimmedInput };
     setMessages((prev) => [...prev, userMessage]);
     setTransientMessage(null);
@@ -131,7 +181,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
     // Local loading state follows the server's `streaming` flag in RTDB.
     try {
       const chatWithLLM = httpsCallable(functions, "chatWithLLM");
-      chatWithLLM({ text: trimmedInput, mode }).catch((err) => {
+      chatWithLLM({ text: trimmedInput, mode, toolProtocol }).catch((err) => {
         console.error("[chatWithLLM] request failed (UI updates via RTDB):", err);
       });
     } catch (err) {
@@ -219,7 +269,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
                 Test Connection
               </button>
             )}
-            <span className="text-xs text-gray-400">opencode/big-pickle</span>
+            <span className="text-xs text-gray-400">{activeModel}</span>
             {onClose && (
               <button
                 onClick={onClose}
@@ -247,6 +297,20 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
               className={`px-3 py-1 transition ${mode === "builder" ? "bg-blue-500 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
             >
               🔨 Builder
+            </button>
+          </div>
+          <div className="inline-flex rounded-full border border-gray-300 overflow-hidden text-xs">
+            <button
+              onClick={() => setToolProtocol("native")}
+              className={`px-3 py-1 transition ${toolProtocol === "native" ? "bg-purple-500 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+            >
+              🧰 Native
+            </button>
+            <button
+              onClick={() => setToolProtocol("text")}
+              className={`px-3 py-1 transition ${toolProtocol === "text" ? "bg-purple-500 text-white" : "bg-white text-gray-600 hover:bg-gray-50"}`}
+            >
+              🔧 Text
             </button>
           </div>
         </div>
@@ -291,7 +355,7 @@ export default function ChatPanel({ userId, onClose, onToolAction }: ChatPanelPr
                 )}
                 {!isUser && (
                   <div className="text-xs text-gray-400 mt-1">
-                    🤖 opencode/big-pickle
+                    🤖 openrouter/z-ai/glm-5.2:free
                   </div>
                 )}
               </div>
